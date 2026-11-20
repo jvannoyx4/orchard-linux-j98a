@@ -2576,6 +2576,10 @@ brcmf_pcie_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	bus->wowl_supported = pci_pme_capable(pdev, PCI_D3hot);
 	bus->fwvid = drvdata[id->driver_data].vendor;
 	devinfo->fwseed = drvdata[id->driver_data].fw_seed;
+	/* Match the stock J98a loader's random-seed block before NVRAM. */
+	if (devinfo->ci->chip == BRCM_CC_4350_CHIP_ID &&
+	    devinfo->ci->chiprev == 8 && of_machine_is_compatible("apple,j98a"))
+		devinfo->fwseed = true;
 	dev_set_drvdata(&pdev->dev, bus);
 
 	ret = brcmf_alloc(&devinfo->pdev->dev, devinfo->settings);
