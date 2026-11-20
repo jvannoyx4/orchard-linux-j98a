@@ -125,6 +125,16 @@
 			#performance-domain-cells = <0>;
 		};
 
+		/* The integration registers start 0x30000 into the VXD aperture. */
+		vxd: video-codec@207f00000 {
+			compatible = "apple,s8001-vxd";
+			reg = <0x2 0x07f00000 0 0x30000>,
+			      <0x2 0x07f30000 0 0x1000>;
+			interrupts = <AIC_IRQ 177 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_vdec>;
+			status = "disabled";
+		};
+
 		serial0: serial@20a0c0000 {
 			compatible = "apple,s5l-uart";
 			reg = <0x2 0x0a0c0000 0x0 0x4000>;
