@@ -1,0 +1,49 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* Apple A9X PCIe resources from the J98a stock board description. */
+
+&{/soc} {
+	pcie0: pcie@610000000 {
+		compatible = "apple,s8001-pcie";
+		device_type = "pci";
+		reg = <0x6 0x10000000 0x0 0x1000000>,
+		      <0x6 0x00000000 0x0 0x8000>,
+		      <0x6 0x00008000 0x0 0x4000>,
+		      <0x6 0x0a000000 0x0 0x40000>,
+		      <0x6 0x01000000 0x0 0x4000>,
+		      <0x6 0x02000000 0x0 0x4000>,
+		      <0x6 0x03000000 0x0 0x4000>,
+		      <0x6 0x04000000 0x0 0x4000>,
+		      <0x6 0x05000000 0x0 0x4000>,
+		      <0x6 0x06000000 0x0 0x4000>,
+		      <0x6 0x01004000 0x0 0x4000>;
+		reg-names = "config", "rc", "phy", "phy-ip",
+			    "port0", "port1", "port2", "port3", "port4", "port5",
+			    "nvmmu";
+		interrupts = <AIC_IRQ 270 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 273 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 276 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 279 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 282 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 285 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 272 IRQ_TYPE_EDGE_RISING>;
+		interrupt-names = "port0", "port1", "port2", "port3", "port4", "port5",
+				  "nvmmu";
+		msi-controller;
+		msi-parent = <&pcie0>;
+		msi-ranges = <&aic AIC_IRQ 288 IRQ_TYPE_EDGE_RISING 32>;
+		apple,msi-doorbell = <0xbffff000>;
+		#address-cells = <3>;
+		#size-cells = <2>;
+		#interrupt-cells = <1>;
+		interrupt-controller;
+		bus-range = <0x00 0x0f>;
+		ranges = <0x02000000 0x0 0xc0000000
+			  0x7 0xc0000000 0x0 0x40000000>;
+		power-domains = <&ps_pcie>, <&ps_pcie_aux>, <&ps_pcie_ref>,
+				<&ps_pcie_link0>, <&ps_pcie_link1>, <&ps_pcie_link2>,
+				<&ps_pcie_link3>, <&ps_pcie_link4>, <&ps_pcie_link5>;
+		power-domain-names = "core", "aux", "ref", "link0", "link1", "link2",
+				     "link3", "link4", "link5";
+		status = "disabled";
+	};
+};

@@ -8,6 +8,7 @@
 
 #include "s8001-pro.dtsi"
 #include "s8001-j98a-j99a.dtsi"
+#include "s8001-pcie.dtsi"
 
 / {
 	compatible = "apple,j98a", "apple,s8001", "apple,arm-platform";
@@ -21,9 +22,19 @@
 		clock-output-names = "spi3-nclk";
 	};
 
+	uart3_pclk: clock-uart3-pclk {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		/* Boot-populated arm-io clock ID 0x116. */
+		clock-frequency = <60000000>;
+		clock-output-names = "uart3-pclk";
+	};
+
 	aliases {
 		als0 = &als_primary;
+		serial3 = &serial3;
 		serial5 = &serial5;
+		touchscreen0 = &touchscreen0;
 	};
 };
 
@@ -40,8 +51,60 @@
 };
 
 &pinctrl_ap {
+	touch_display_sync_active: touch-display-sync-active {
+		pinmux = <APPLE_PINMUX(84, 2)>;
+	};
+
+	touch_display_sync_inactive: touch-display-sync-inactive {
+		pinmux = <APPLE_PINMUX(84, 0)>;
+	};
+
+	bt_uart_pins: bt-uart-pins {
+		/* Only TX and RTS have pin functions in the stock board tree. */
+		pinmux = <APPLE_PINMUX(90, 1)>, <APPLE_PINMUX(92, 1)>;
+	};
+
+	wlan_clkreq_pins: wlan-clkreq-pins {
+		pinmux = <APPLE_PINMUX(106, 1)>;
+	};
+
 	battery_swi_pins: battery-swi-pins {
 		pinmux = <APPLE_PINMUX(130, 1)>;
+	};
+};
+
+&serial3 {
+	clocks = <&uart3_pclk>, <&clkref>;
+	pinctrl-names = "default";
+	pinctrl-0 = <&bt_uart_pins>;
+	uart-has-rtscts;
+	/* Enable only with a qualified Bluetooth transport/firmware sequence. */
+};
+
+&pcie0 {
+	/* The first test exposes only Wi-Fi; bus 1 therefore uses DART2. */
+	iommu-map = <0x100 &pcie0_dart2 0 0x0 0x80000000 0x0 0x3ffff000 1>;
+	iommu-map-mask = <0xff00>;
+	power-domains = <&ps_pcie>, <&ps_pcie_aux>, <&ps_pcie_ref>, <&ps_pcie_link2>;
+	power-domain-names = "core", "aux", "ref", "link2";
+	pinctrl-names = "default";
+	pinctrl-0 = <&wlan_clkreq_pins>;
+	apple,lane-cfg = <1>;
+
+	pcie_wifi: pci@2,0 {
+		device_type = "pci";
+		reg = <0x1000 0x0 0x0 0x0 0x0>;
+		reset-gpios = <&pinctrl_ap 100 GPIO_ACTIVE_LOW>;
+		num-lanes = <1>;
+		max-link-speed = <1>;
+		apple,msi-vector-range = <16 4>;
+		apple,manual-availability-iommu = <&pcie0_dart2 0>;
+		aspm-no-l0s;
+		aspm-no-l1;
+		#address-cells = <3>;
+		#size-cells = <2>;
+		ranges;
+		status = "disabled";
 	};
 };
 
@@ -82,6 +145,7 @@
 		apple,error-reflector = /bits/ 64 <0x20fffc000>;
 		apple,fetch-config = <0x000e0303>;
 		apple,diag-config = <0x00000100>;
+		apple,manual-availability;
 		status = "disabled";
 	};
 
@@ -123,4 +187,26 @@
 	clocks = <&spi3_nclk>;
 	cs-gpios = <&pinctrl_ap 169 GPIO_ACTIVE_LOW>;
 	status = "okay";
+
+	/* Opt-in transport probe only; no contact or Pencil reports yet. */
+	touchscreen0: touchscreen@0 {
+		compatible = "apple,j98a-touchscreen";
+		reg = <0>;
+		/* Conservative initial test rate, not a qualified board maximum. */
+		spi-max-frequency = <500000>;
+		/* Stock CS Delay 10000 is nanoseconds on each CS edge. */
+		spi-cs-setup-delay-ns = <10000>;
+		spi-cs-hold-delay-ns = <10000>;
+		apple,half-clock-delay;
+		spi-cpha;
+		spi-cpol;
+		reset-gpios = <&pinctrl_ap 210 GPIO_ACTIVE_LOW>;
+		power-ana-gpios = <&pinctrl_ap 137 GPIO_ACTIVE_HIGH>;
+		power-ldo-gpios = <&pinctrl_ap 207 GPIO_ACTIVE_HIGH>;
+		clocks = <&touch_clk>;
+		pinctrl-names = "display-sync-active", "display-sync-inactive";
+		pinctrl-0 = <&touch_display_sync_active>;
+		pinctrl-1 = <&touch_display_sync_inactive>;
+		status = "disabled";
+	};
 };
