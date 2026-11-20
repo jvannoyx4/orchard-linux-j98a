@@ -268,6 +268,19 @@ patternProperties:
           the controller's Link Capabilities registers when runtime speed
           retraining is not implemented for the port.
 
+      apple,msi-vector-range:
+        $ref: /schemas/types.yaml#/definitions/uint32-array
+        items:
+          - minimum: 0
+            maximum: 31
+          - enum: [1, 2, 4, 8, 16, 32]
+        description:
+          First vector and number of vectors assigned to this root port,
+          relative to the controller's 32-vector MSI range. The first vector
+          must be aligned to the count. Enabled ports must have disjoint
+          ranges. If omitted, the port uses eight vectors starting at eight
+          times the root-port number.
+
       apple,phy-lane:
         $ref: /schemas/types.yaml#/definitions/uint32
         maximum: 3

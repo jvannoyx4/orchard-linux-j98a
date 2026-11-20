@@ -49,7 +49,7 @@
 
 #define H9P_NUM_PORTS			4
 #define H9P_NUM_MSI			32
-#define H9P_MSI_PER_PORT		(H9P_NUM_MSI / H9P_NUM_PORTS)
+#define H9P_DEFAULT_MSI_PER_PORT	8
 #define H9P_NUM_CLOCKS			2
 
 #define H9P_CFG_PORT_STRIDE		0x8000
@@ -124,7 +124,6 @@
 #define H9P_PORT_IRQMASK_LINK_UP	0xff002f0f
 /* MSI control: enable | log2(vectors per port) << 4 (AppleS800xPCIePort) */
 #define H9P_PORT_MSICTL			0x0124
-#define H9P_PORT_MSICTL_INIT		(1 | ilog2(H9P_MSI_PER_PORT) << 4)
 #define H9P_PORT_MSIVECBASE		0x0128
 #define H9P_PORT_ENABLE		0x0140
 #define H9P_PORT_ENABLE_APPLE		BIT(31)
@@ -672,6 +671,11 @@ struct apple_h9p_hw {
 	bool j172_bridge_quirk;
 };
 
+struct apple_h9p_msi_range {
+	u8 first;
+	u8 count;
+};
+
 struct apple_h9p_pcie {
 	struct device *dev;
 	struct platform_device *pdev;
@@ -718,9 +722,10 @@ struct apple_h9p_pcie {
 	struct device_link **pd_link;
 	int pd_count;
 
-	DECLARE_BITMAP(used_msi[H9P_NUM_PORTS], H9P_MSI_PER_PORT);
+	struct apple_h9p_msi_range msi_range[H9P_NUM_PORTS];
+	DECLARE_BITMAP(used_msi, H9P_NUM_MSI);
 	u64 msi_doorbell;
-	/* Protects the per-port MSI allocation bitmaps. */
+	/* Protects the controller-wide vector allocation bitmap. */
 	spinlock_t used_msi_lock;
 	struct irq_domain *irq_dom;
 	struct irq_fwspec msi_fwspec;
@@ -1351,6 +1356,36 @@ static struct irq_chip apple_h9p_msi_bottom_chip = {
 	.irq_compose_msi_msg = apple_h9p_msi_compose_msg,
 };
 
+/*
+ * Port vector windows may be nonuniform. The MSI message carries the
+ * controller-relative vector, also the index in used_msi.
+ */
+static unsigned int apple_h9p_msi_claim(struct apple_h9p_pcie *pcie,
+				       unsigned int port)
+{
+	const struct apple_h9p_msi_range *range = &pcie->msi_range[port];
+	unsigned int end = range->first + range->count;
+	unsigned int vector;
+
+	vector = find_next_zero_bit(pcie->used_msi, end, range->first);
+	if (vector < end) {
+		__set_bit(vector, pcie->used_msi);
+		return vector;
+	}
+	return H9P_NUM_MSI;
+}
+
+static u32 apple_h9p_port_msictl(struct apple_h9p_pcie *pcie, unsigned int port)
+{
+	return 1 | (ilog2(pcie->msi_range[port].count) << 4);
+}
+
+static u32 apple_h9p_port_msivecbase(struct apple_h9p_pcie *pcie,
+				     unsigned int port)
+{
+	return pcie->msi_range[port].first * 0x10001;
+}
+
 static int apple_h9p_msi_alloc(struct irq_domain *domain, unsigned int virq,
 			       unsigned int nr_irqs, void *args)
 {
@@ -1361,8 +1396,8 @@ static int apple_h9p_msi_alloc(struct irq_domain *domain, unsigned int virq,
 	struct device *msi_dev = desc ? msi_desc_to_dev(desc) : NULL;
 	struct pci_dev *pdev;
 	unsigned long flags;
-	unsigned int port;
-	int ret, slot;
+	unsigned int port, vector;
+	int ret;
 
 	if (nr_irqs != 1 || !msi_dev || !dev_is_pci(msi_dev))
 		return -ENOSPC;
@@ -1378,26 +1413,21 @@ static int apple_h9p_msi_alloc(struct irq_domain *domain, unsigned int virq,
 		return -ENOSPC;
 
 	spin_lock_irqsave(&pcie->used_msi_lock, flags);
-	slot = find_first_zero_bit(pcie->used_msi[port], H9P_MSI_PER_PORT);
-	if (slot >= H9P_MSI_PER_PORT) {
-		spin_unlock_irqrestore(&pcie->used_msi_lock, flags);
-		return -ENOSPC;
-	}
-	__set_bit(slot, pcie->used_msi[port]);
+	vector = apple_h9p_msi_claim(pcie, port);
 	spin_unlock_irqrestore(&pcie->used_msi_lock, flags);
+	if (vector == H9P_NUM_MSI)
+		return -ENOSPC;
 
-	fwspec.param[fwspec.param_count - 2] +=
-		port * H9P_MSI_PER_PORT + slot;
+	fwspec.param[fwspec.param_count - 2] += vector;
 	ret = irq_domain_alloc_irqs_parent(domain, virq, 1, &fwspec);
 	if (ret) {
 		spin_lock_irqsave(&pcie->used_msi_lock, flags);
-		__clear_bit(slot, pcie->used_msi[port]);
+		__clear_bit(vector, pcie->used_msi);
 		spin_unlock_irqrestore(&pcie->used_msi_lock, flags);
 		return ret;
 	}
 
-	irq_domain_set_hwirq_and_chip(domain, virq,
-				      port * H9P_MSI_PER_PORT + slot,
+	irq_domain_set_hwirq_and_chip(domain, virq, vector,
 				      &apple_h9p_msi_bottom_chip, pcie);
 	return 0;
 }
@@ -1420,11 +1450,9 @@ static void apple_h9p_msi_free(struct irq_domain *domain, unsigned int virq,
 	spin_lock_irqsave(&pcie->used_msi_lock, flags);
 	for (i = 0; i < nr_irqs; i++) {
 		irq_hw_number_t irq = hwirq + i;
-		unsigned int port = irq / H9P_MSI_PER_PORT;
-		unsigned int slot = irq % H9P_MSI_PER_PORT;
 
-		if (port < H9P_NUM_PORTS)
-			__clear_bit(slot, pcie->used_msi[port]);
+		if (irq < H9P_NUM_MSI)
+			__clear_bit(irq, pcie->used_msi);
 	}
 	spin_unlock_irqrestore(&pcie->used_msi_lock, flags);
 }
@@ -2049,8 +2077,9 @@ static int apple_t8010_setup_port(struct apple_h9p_pcie *pcie, unsigned int port
 
 	h9p_rmw(pcie->base_port[port] + H9P_PORT_ENABLE, 0,
 		H9P_PORT_ENABLE_APPLE);
-	writel(H9P_PORT_MSICTL_INIT, pcie->base_port[port] + H9P_PORT_MSICTL);
-	writel(port * 0x10001 * H9P_MSI_PER_PORT,
+	writel(apple_h9p_port_msictl(pcie, port),
+	       pcie->base_port[port] + H9P_PORT_MSICTL);
+	writel(apple_h9p_port_msivecbase(pcie, port),
 	       pcie->base_port[port] + H9P_PORT_MSIVECBASE);
 
 	if (port == 3) {
@@ -2371,8 +2400,8 @@ static int apple_t8015_setup_port(struct apple_h9p_pcie *pcie, unsigned int port
 	}
 
 	h9p_rmw(base + H9P_PORT_ENABLE, 0, H9P_PORT_ENABLE_APPLE);
-	writel(H9P_PORT_MSICTL_INIT, base + H9P_PORT_MSICTL);
-	writel(port * 0x10001 * H9P_MSI_PER_PORT,
+	writel(apple_h9p_port_msictl(pcie, port), base + H9P_PORT_MSICTL);
+	writel(apple_h9p_port_msivecbase(pcie, port),
 	       base + H9P_PORT_MSIVECBASE);
 
 	ret = gpiod_direction_output(pcie->perst[port], 0);
@@ -2485,9 +2514,8 @@ static int apple_t7000_setup_port(struct apple_h9p_pcie *pcie, unsigned int port
 	h9p_writel_flush(0, base + T7000_PORT_CTL_114);
 	h9p_writel_flush(T7000_PORT_IRQMASK_INIT, base + H9P_PORT_IRQMASK);
 	h9p_writel_flush(T7000_PORT_IRQSTAT_INIT, base + H9P_PORT_IRQSTAT);
-	/* MSI enable with 2^3 vectors. */
-	h9p_writel_flush(H9P_PORT_MSICTL_INIT, base + H9P_PORT_MSICTL);
-	h9p_writel_flush(port * 0x10001 * H9P_MSI_PER_PORT,
+	h9p_writel_flush(apple_h9p_port_msictl(pcie, port), base + H9P_PORT_MSICTL);
+	h9p_writel_flush(apple_h9p_port_msivecbase(pcie, port),
 			 base + H9P_PORT_MSIVECBASE);
 
 	ret = gpiod_direction_output(pcie->perst[port], 0);
@@ -2858,8 +2886,8 @@ static int apple_s8003_start_link(struct apple_h9p_pcie *pcie,
 	writel(H9P_PORT_IRQMASK_PRE_LINK, pb + H9P_PORT_IRQMASK);
 	writel(H9P_PORT_IRQSTAT_PRE_LINK, pb + H9P_PORT_IRQSTAT);
 	h9p_rmw(pb + H9P_PORT_ENABLE, 0, H9P_PORT_ENABLE_APPLE);
-	writel(H9P_PORT_MSICTL_INIT, pb + H9P_PORT_MSICTL);
-	writel(port * 0x10001 * H9P_MSI_PER_PORT, pb + H9P_PORT_MSIVECBASE);
+	writel(apple_h9p_port_msictl(pcie, port), pb + H9P_PORT_MSICTL);
+	writel(apple_h9p_port_msivecbase(pcie, port), pb + H9P_PORT_MSIVECBASE);
 
 	msleep(S8003_PERST_HOLD_MS);
 	ret = gpiod_direction_output(pcie->perst[port], 0);
@@ -3276,10 +3304,46 @@ static void apple_h9p_pcie_put_port_nodes(void *data)
 		of_node_put(pcie->manual_dart[i]);
 }
 
+/* Validate the unshared, power-of-two slice decoded by each root port. */
+static int apple_h9p_msi_set_range(struct apple_h9p_msi_range *range,
+				   unsigned long *assigned, u32 first, u32 count)
+{
+	if (!is_power_of_2(count) || count > H9P_NUM_MSI ||
+	    first > H9P_NUM_MSI - count || !IS_ALIGNED(first, count))
+		return -EINVAL;
+	if (find_next_bit(assigned, first + count, first) < first + count)
+		return -EINVAL;
+
+	bitmap_set(assigned, first, count);
+	range->first = first;
+	range->count = count;
+	return 0;
+}
+
+static int apple_h9p_parse_msi_range(struct apple_h9p_pcie *pcie,
+				    struct device_node *np, unsigned int port,
+				    unsigned long *assigned)
+{
+	u32 cells[2] = { port * H9P_DEFAULT_MSI_PER_PORT,
+			 H9P_DEFAULT_MSI_PER_PORT };
+	int ret;
+
+	if (of_property_present(np, "apple,msi-vector-range")) {
+		ret = of_property_read_variable_u32_array(np,
+				"apple,msi-vector-range", cells, 2, 2);
+		if (ret < 0)
+			return ret;
+	}
+
+	return apple_h9p_msi_set_range(&pcie->msi_range[port], assigned,
+				       cells[0], cells[1]);
+}
+
 static int apple_h9p_pcie_parse_ports(struct apple_h9p_pcie *pcie)
 {
 	struct device *dev = pcie->dev;
 	struct device_node *np;
+	DECLARE_BITMAP(assigned_msi, H9P_NUM_MSI) = {};
 	u32 reg, port, phy_lane;
 	int max_link_speed, ret;
 
@@ -3304,6 +3368,12 @@ static int apple_h9p_pcie_parse_ports(struct apple_h9p_pcie *pcie)
 		port = reg >> 11;
 		if (port >= H9P_NUM_PORTS || pcie->port_nodes[port]) {
 			ret = -EINVAL;
+			goto out_put_child;
+		}
+
+		ret = apple_h9p_parse_msi_range(pcie, np, port, assigned_msi);
+		if (ret) {
+			dev_err(dev, "%pOF: invalid or overlapping MSI vector range\n", np);
 			goto out_put_child;
 		}
 
