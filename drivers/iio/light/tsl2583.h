@@ -6,8 +6,10 @@
 #include <linux/kernel.h>
 #include <linux/math64.h>
 #include <linux/overflow.h>
+#include <linux/string.h>
 #include <linux/time64.h>
 #include <linux/types.h>
+#include <linux/unaligned.h>
 
 /*
  * Fixed-point scale of the per-gain-step ratios in an Apple LSCI ambient-light
@@ -16,6 +18,39 @@
  */
 #define CT819_CAL_RATIO_SCALE 256
 #define CT821_CAL_RATIO_SCALE 255
+
+/*
+ * The two CT821s on J98a share a v3 LSCI slot. Its two 82-byte records
+ * follow the 8-byte header without the alignment padding present in the
+ * single-sensor format. The rest of the factory slot is zero padding.
+ */
+static inline const u8 *ct821_paired_record(const u8 *data, size_t len,
+					   u32 orientation)
+{
+	enum { header = 8, stride = 82, count = 2, total = header + stride * count };
+	const u8 *match = NULL;
+	int i;
+
+	if (len < total || data[1] != 3 || data[2] != count ||
+	    data[3] != header || get_unaligned_le16(data + 4) != total ||
+	    memchr_inv(data + total, 0, len - total))
+		return NULL;
+
+	for (i = 0; i < count; i++) {
+		const u8 *record = data + header + i * stride;
+
+		if (record[0] || record[1] != 1 || record[3] != stride ||
+		    record[4] != 1)
+			return NULL;
+		if (record[2] == orientation) {
+			if (match)
+				return NULL;
+			match = record;
+		}
+	}
+
+	return match;
+}
 
 static inline int apple_als_calculate_gain_factor(u32 previous, u16 ratio,
 						  u32 scale, u32 *next)

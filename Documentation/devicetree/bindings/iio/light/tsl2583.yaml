@@ -47,6 +47,19 @@ properties:
       the ADT alsCalibration property as resolved by iBoot. Used instead of
       nvmem-cells when present.
 
+  apple,calibration-orientation:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    enum: [5, 6]
+    description: |
+      Orientation identifier of this CT821 in the two-sensor factory LSCI
+      table. Matches the orientation in the individual sensor record.
+
+  apple,calibration-source:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: |
+      Peer CT821 node carrying the common apple,als-calibration table.
+      Both sensors share one factory slot.
+
   nvmem-cells:
     description:
       Apple factory LSCI ambient-light calibration data. Boot firmware must
@@ -62,7 +75,17 @@ required:
   - compatible
   - reg
 
+dependentRequired:
+  apple,calibration-source: ["apple,calibration-orientation"]
+
 allOf:
+  - if:
+      required: ["apple,calibration-orientation"]
+    then:
+      properties:
+        compatible:
+          contains:
+            const: apple,ct821
   - if:
       properties:
         compatible:

@@ -5,6 +5,28 @@
 
 #include "tsl2583.h"
 
+static void ct821_paired_record_test(struct kunit *test)
+{
+	u8 data[200] = {
+		[1] = 3, [2] = 2, [3] = 8, [4] = 172,
+		[9] = 1, [10] = 6, [11] = 82, [12] = 1,
+		[91] = 1, [92] = 5, [93] = 82, [94] = 1,
+	};
+
+	KUNIT_EXPECT_PTR_EQ(test, ct821_paired_record(data, sizeof(data), 6), &data[8]);
+	KUNIT_EXPECT_PTR_EQ(test, ct821_paired_record(data, 172, 5), &data[90]);
+	KUNIT_EXPECT_NULL(test, ct821_paired_record(data, 171, 5));
+	KUNIT_EXPECT_NULL(test, ct821_paired_record(data, sizeof(data), 1));
+	data[199] = 1;
+	KUNIT_EXPECT_NULL(test, ct821_paired_record(data, sizeof(data), 5));
+	data[199] = 0;
+	data[92] = 6;
+	KUNIT_EXPECT_NULL(test, ct821_paired_record(data, sizeof(data), 6));
+	data[92] = 5;
+	data[93] = 81;
+	KUNIT_EXPECT_NULL(test, ct821_paired_record(data, sizeof(data), 6));
+}
+
 static void ct821_gain_factor_valid_test(struct kunit *test)
 {
 	u32 factor;
@@ -215,6 +237,7 @@ static struct kunit_suite ct819_lux_test_suite = {
 };
 
 static struct kunit_case ct821_gain_factor_test_cases[] = {
+	KUNIT_CASE(ct821_paired_record_test),
 	KUNIT_CASE(ct821_gain_factor_valid_test),
 	KUNIT_CASE(ct821_gain_factor_zero_test),
 	KUNIT_CASE(ct821_gain_factor_overflow_test),

@@ -134,6 +134,7 @@ struct tsl2583_chip {
 	struct apple_als_calibration cal;
 	u16 integration_cycles;
 	bool needs_reinit;
+	bool raw_only;
 };
 
 struct gainadj {
@@ -262,28 +263,43 @@ static bool apple_als_record_is_supported(const struct tsl2583_chip_info *info,
  * The record comes from the bootloader (the ADT's resolved alsCalibration)
  * or from a SysCfg NVMEM cell. The caller frees it.
  */
-static u8 *apple_als_read_calibration(struct device *dev, size_t *len)
+static u8 *apple_als_copy_calibration(struct fwnode_handle *source, size_t *len)
 {
-	struct nvmem_cell *cell;
 	u8 *data;
 	int ret;
 
-	if (device_property_present(dev, "apple,als-calibration")) {
-		ret = device_property_count_u8(dev, "apple,als-calibration");
-		if (ret <= 0)
-			return ERR_PTR(ret ?: -EINVAL);
-		*len = ret;
+	ret = fwnode_property_count_u8(source, "apple,als-calibration");
+	if (ret <= 0)
+		return ERR_PTR(ret ?: -EINVAL);
+	*len = ret;
+	data = kmalloc(*len, GFP_KERNEL);
+	if (!data)
+		return ERR_PTR(-ENOMEM);
+	ret = fwnode_property_read_u8_array(source, "apple,als-calibration",
+					    data, *len);
+	if (ret) {
+		kfree(data);
+		return ERR_PTR(ret);
+	}
+	return data;
+}
 
-		data = kmalloc(*len, GFP_KERNEL);
-		if (!data)
-			return ERR_PTR(-ENOMEM);
-		ret = device_property_read_u8_array(dev, "apple,als-calibration",
-						    data, *len);
-		if (ret) {
-			kfree(data);
-			return ERR_PTR(ret);
-		}
+static u8 *apple_als_read_calibration(struct device *dev, size_t *len)
+{
+	struct fwnode_handle *source;
+	struct nvmem_cell *cell;
+	u8 *data;
 
+	if (device_property_present(dev, "apple,als-calibration"))
+		return apple_als_copy_calibration(dev_fwnode(dev), len);
+
+	if (device_property_present(dev, "apple,calibration-source") &&
+	    !device_property_present(dev, "nvmem-cells")) {
+		source = fwnode_find_reference(dev_fwnode(dev), "apple,calibration-source", 0);
+		if (IS_ERR(source))
+			return ERR_CAST(source);
+		data = apple_als_copy_calibration(source, len);
+		fwnode_handle_put(source);
 		return data;
 	}
 
@@ -302,6 +318,8 @@ static int apple_als_load_calibration(struct tsl2583_chip *chip)
 	const u8 *record;
 	size_t len;
 	u32 checksum = 0;
+	u32 orientation;
+	bool paired = device_property_present(dev, "apple,calibration-orientation");
 	u8 *data;
 	int gain_index;
 	int ret;
@@ -312,13 +330,25 @@ static int apple_als_load_calibration(struct tsl2583_chip *chip)
 		return dev_err_probe(dev, PTR_ERR(data),
 				     "failed to read LSCI calibration\n");
 
-	if (len < APPLE_ALS_CAL_HEADER_SIZE + info->cal_record_size ||
-	    len & 1 || data[1] != info->cal_version || data[2] != 1 ||
-	    data[3] != APPLE_ALS_CAL_HEADER_SIZE ||
-	    get_unaligned_le16(data + 4) != len) {
-		dev_err(dev, "invalid LSCI v%u calibration header\n",
-			info->cal_version);
-		goto invalid;
+	if (paired) {
+		if (info->cal_version != 3 || (len & 1) ||
+		    device_property_read_u32(dev, "apple,calibration-orientation", &orientation))
+			goto invalid;
+		record = ct821_paired_record(data, len, orientation);
+		if (!record) {
+			dev_err(dev, "no matching CT821 calibration record\n");
+			goto invalid;
+		}
+	} else {
+		if (len < APPLE_ALS_CAL_HEADER_SIZE + info->cal_record_size ||
+		    len & 1 || data[1] != info->cal_version || data[2] != 1 ||
+		    data[3] != APPLE_ALS_CAL_HEADER_SIZE ||
+		    get_unaligned_le16(data + 4) != len) {
+			dev_err(dev, "invalid LSCI v%u calibration header\n",
+				info->cal_version);
+			goto invalid;
+		}
+		record = data + data[3];
 	}
 
 	for (i = 0; i < len; i += 2)
@@ -328,15 +358,18 @@ static int apple_als_load_calibration(struct tsl2583_chip *chip)
 		goto invalid;
 	}
 
-	record = data + data[3];
 	if (!apple_als_record_is_supported(info, record)) {
 		dev_err(dev, "unsupported LSCI v%u calibration record\n",
 			info->cal_version);
 		goto invalid;
 	}
 	if (memchr_inv(record + 0x2a, 0, 6)) {
-		dev_err(dev, "unsupported LSCI backlight-leakage calibration\n");
-		goto invalid;
+		if (!paired) {
+			dev_err(dev, "unsupported LSCI backlight-leakage calibration\n");
+			goto invalid;
+		}
+		/* Lux needs backlight compensation. Both photodiodes are readable. */
+		chip->raw_only = true;
 	}
 
 	cal->lux_fudge = get_unaligned_le16(record + 0x08);
@@ -504,6 +537,8 @@ static int tsl2583_get_lux(struct iio_dev *indio_dev)
 
 	chip->als_cur_info.als_ch0 = ch0;
 	chip->als_cur_info.als_ch1 = ch1;
+	if (chip->raw_only)
+		return 0;
 	if (chip->info->apple) {
 		ret = apple_als_get_lux(chip, ch0, ch1);
 		if (ret >= 0)
@@ -1282,6 +1317,10 @@ static const struct iio_info ct819_iio_info = {
 	.write_raw = tsl2583_write_raw,
 };
 
+static const struct iio_info ct821_raw_info = {
+	.read_raw = tsl2583_read_raw,
+};
+
 static const struct iio_info ct821_iio_info = {
 	.attrs = &ct821_attribute_group,
 	.read_raw = tsl2583_read_raw,
@@ -1397,6 +1436,12 @@ static int tsl2583_probe(struct i2c_client *clientp)
 		ret = apple_als_load_calibration(chip);
 		if (ret)
 			return ret;
+		if (chip->raw_only) {
+			/* The first two channels expose only the raw photodiode readings. */
+			indio_dev->info = &ct821_raw_info;
+			indio_dev->num_channels = ARRAY_SIZE(tsl2583_channels) - 1;
+			dev_info(&clientp->dev, "backlight compensation unavailable; raw channels only\n");
+		}
 	}
 
 	pm_runtime_enable(&clientp->dev);
