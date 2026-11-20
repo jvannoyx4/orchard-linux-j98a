@@ -18,6 +18,18 @@
 	};
 };
 
+&i2c1 {
+	status = "okay";
+
+	wireless_gpio: gpio@43 {
+		compatible = "ti,tca7408";
+		reg = <0x43>;
+		gpio-controller;
+		#gpio-cells = <2>;
+		gpio-line-names = "bluetooth-enable", "wlan-enable";
+	};
+};
+
 &pinctrl_ap {
 	battery_swi_pins: battery-swi-pins {
 		pinmux = <APPLE_PINMUX(130, 1)>;
