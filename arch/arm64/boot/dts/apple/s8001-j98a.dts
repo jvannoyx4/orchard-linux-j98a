@@ -196,7 +196,7 @@
 	cs-gpios = <&pinctrl_ap 169 GPIO_ACTIVE_LOW>;
 	status = "okay";
 
-	/* Opt-in transport probe only; no contact or Pencil reports yet. */
+	/* Opt-in bounded diagnostics only; no Linux input device yet. */
 	touchscreen0: touchscreen@0 {
 		compatible = "apple,j98a-touchscreen";
 		reg = <0>;
@@ -209,6 +209,10 @@
 		spi-cpha;
 		spi-cpol;
 		reset-gpios = <&pinctrl_ap 210 GPIO_ACTIVE_LOW>;
+		/* Stock GPIO mode 0xA maps to falling-edge interrupt on AP208. */
+		interrupt-parent = <&pinctrl_ap>;
+		interrupts = <208 IRQ_TYPE_EDGE_FALLING>;
+		attn-gpios = <&pinctrl_ap 208 GPIO_ACTIVE_LOW>;
 		power-ana-gpios = <&pinctrl_ap 137 GPIO_ACTIVE_HIGH>;
 		power-ldo-gpios = <&pinctrl_ap 207 GPIO_ACTIVE_HIGH>;
 		clocks = <&touch_clk>;

@@ -158,8 +158,11 @@ allOf:
           const: apple,j98a-touchscreen
     then:
       description:
-        J98a currently supports only an explicitly requested HBPP readiness
-        probe. Firmware loading, interrupts and input reports are not enabled.
+        J98a currently supports explicitly requested, bounded transport and
+        contact diagnostics. The IRQ and its active-low attention GPIO allow
+        sampling only after readiness or interrupt events. No input device is
+        registered. Firmware and unit calibration are supplied separately for
+        the diagnostic; display pixel dimensions are not touch coordinates.
       properties:
         pinctrl-names:
           items:
@@ -169,6 +172,8 @@ allOf:
         display-sync1-gpios: false
       required:
         - clocks
+        - interrupts
+        - attn-gpios
         - power-ana-gpios
         - power-ldo-gpios
         - pinctrl-0
@@ -231,6 +236,20 @@ allOf:
     else:
       properties:
         ana-supply: false
+  - if:
+      properties:
+        compatible:
+          enum:
+            - apple,j71t-touchscreen
+            - apple,j81-touchscreen
+            - apple,j96-touchscreen
+            - apple,j98a-touchscreen
+    then:
+      properties:
+        attn-gpios:
+          maxItems: 1
+    else:
+      properties:
         attn-gpios: false
   - if:
       properties:

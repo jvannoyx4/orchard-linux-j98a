@@ -5,6 +5,7 @@
  * Copyright (C) The Asahi Linux Contributors
  */
 
+#include <linux/atomic.h>
 #include <linux/bitmap.h>
 #include <linux/bitrev.h>
 #include <linux/bits.h>
@@ -26,6 +27,7 @@
 #include <linux/regulator/consumer.h>
 #include <linux/spi/spi.h>
 #include <linux/unaligned.h>
+#include <linux/wait.h>
 #include <linux/workqueue.h>
 
 #include "apple_z2_n61.h"
@@ -158,6 +160,21 @@ module_param(j98a_firmware_probe, bool, 0400);
 MODULE_PARM_DESC(j98a_firmware_probe,
 		"With j98a_probe, upload private J98a RAM firmware and read metadata once; no input");
 
+static unsigned int j98a_runtime_probe_ms;
+module_param(j98a_runtime_probe_ms, uint, 0400);
+MODULE_PARM_DESC(j98a_runtime_probe_ms,
+		"With J98a firmware probe, read descriptors and sample frames for up to 15000 ms; no input");
+
+static bool j98a_descriptor_samples;
+module_param(j98a_descriptor_samples, bool, 0400);
+MODULE_PARM_DESC(j98a_descriptor_samples,
+		"With J98a firmware probe, compare three D3 read speeds; no input");
+
+static bool j98a_irq_probe;
+module_param(j98a_irq_probe, bool, 0400);
+MODULE_PARM_DESC(j98a_irq_probe,
+		"With bounded J98a runtime probe, sample only on IRQ or initial asserted ATN; no input");
+
 struct apple_z2_hbpp_reg {
 	u32 addr;
 	u32 value;
@@ -283,6 +300,12 @@ struct apple_z2 {
 	bool hv_enabled;
 	bool core_enabled;
 	enum apple_z2_protocol_state protocol_state;
+	unsigned int j98a_probe_hz;
+	wait_queue_head_t j98a_irq_wait;
+	atomic_t j98a_irq_pending;
+	atomic_t j98a_irq_count;
+	unsigned int j98a_trace_frames;
+	unsigned int j98a_contact_counts[4];
 	unsigned int bpw16_min_len;
 	unsigned int dma_min_len;
 	unsigned int z2_inter_packet_delay_us;
@@ -1189,6 +1212,7 @@ static int apple_z2_z2_raw_xfer_locked(struct apple_z2 *z2, const char *tag,
 		.tx_buf = z2->tx_buf,
 		.rx_buf = z2->rx_buf,
 		.len = APPLE_Z2_CMD_SIZE,
+		.speed_hz = z2->j98a_probe_hz,
 	};
 	int error;
 
@@ -1381,7 +1405,7 @@ static int apple_z2_read_report_info_locked(struct apple_z2 *z2, u8 report,
 static int apple_z2_read_report_locked(struct apple_z2 *z2, u8 report,
 				       u16 len, const char *tag)
 {
-	struct spi_transfer xfer = { };
+	struct spi_transfer xfer = { .speed_hz = z2->j98a_probe_hz };
 	char last_tag[32];
 	unsigned int data_len;
 	int error;
@@ -1437,6 +1461,10 @@ static int apple_z2_read_report_locked(struct apple_z2 *z2, u8 report,
 		xfer.rx_buf = z2->rx_buf;
 		xfer.len = data_len;
 		error = spi_sync_transfer(z2->spidev, &xfer, 1);
+		if (z2->j98a_probe_hz)
+			dev_info(&z2->spidev->dev,
+				 "J98a descriptor SPI requested=%u effective=%u len=%u result=%d\n",
+				 xfer.speed_hz, xfer.effective_speed_hz, data_len, error);
 	}
 	if (error)
 		return error;
@@ -4351,6 +4379,8 @@ static const struct apple_z2_chip_info apple_z2_j98a_probe_info = {
 
 #define APPLE_Z2_J98A_TEST_FIRMWARE "apple/j98a-touch-test.z2fw"
 #define APPLE_Z2_J98A_UPLOAD_HZ 4000000
+/* Stock's 41 ns period selects divider 3; verified effective rate 20512820 Hz. */
+#define APPLE_Z2_J98A_RUNTIME_HZ 24000000
 #define APPLE_Z2_J98A_PACKETS 8
 
 struct apple_z2_j98a_firmware {
@@ -4462,6 +4492,397 @@ static int apple_z2_j98a_check_firmware(const struct firmware *fw,
 	return pos == fw->size ? 0 : -EINVAL;
 }
 
+static int apple_z2_j98a_read_descriptor(struct apple_z2 *z2, u8 report, u16 len)
+{
+	u8 command = len <= 11 ? APPLE_Z2_CMD_CTRL_READ_SHORT :
+				APPLE_Z2_CMD_CTRL_READ_LONG;
+	u32 wire_len = len <= 11 ? APPLE_Z2_CMD_SIZE : len + 5;
+	const u8 *data;
+	int error;
+
+	if (!((report == 0xd1 && len == 1) || (report == 0xd3 && len == 12) ||
+	      (report == APPLE_Z2_REPORT_SURFACE && len == 16)))
+		return -EINVAL;
+	error = apple_z2_read_report_locked(z2, report, len, "j98a-descriptor");
+	if (error)
+		return error;
+	dev_info(&z2->spidev->dev, "J98a descriptor %02x wire reply (%u bytes): %*ph\n",
+		 report, wire_len, wire_len, z2->rx_buf);
+	dev_info(&z2->spidev->dev,
+		 "J98a descriptor %02x command=%02x expected=%02x checksum=%04x expected=%04x\n",
+		 report, z2->rx_buf[0], command,
+		 get_unaligned_le16(z2->rx_buf + wire_len - 2),
+		 apple_z2_hbpp_sum(z2->rx_buf, wire_len - 2));
+	if (z2->rx_buf[0] != command || z2->rx_buf[1] != report ||
+	    z2->rx_buf[2] || !apple_z2_z2_checksum_valid(z2->rx_buf, wire_len))
+		return -EPROTO;
+	data = z2->rx_buf + 3;
+	dev_info(&z2->spidev->dev, "J98a descriptor %02x (%u bytes): %*ph\n",
+		 report, len, len, data);
+	if (report == APPLE_Z2_REPORT_SURFACE) {
+		u32 width = get_unaligned_le32(data);
+		u32 height = get_unaligned_le32(data + 4);
+		s16 min_x = (s16)get_unaligned_le16(data + 8);
+		s16 min_y = (s16)get_unaligned_le16(data + 10);
+		s16 max_x = (s16)get_unaligned_le16(data + 12);
+		s16 max_y = (s16)get_unaligned_le16(data + 14);
+
+		if (!width || !height || min_x >= max_x || min_y >= max_y)
+			return -EPROTO;
+		dev_info(&z2->spidev->dev,
+			 "J98a D9 width=%u height=%u bounds x=%d..%d y=%d..%d (descriptor units)\n",
+			 width, height, min_x, max_x, min_y, max_y);
+	}
+	return 0;
+}
+
+/* An explicitly selected fixed sample set, independent of prior outcomes. */
+static int apple_z2_j98a_descriptor_sample_set(struct apple_z2 *z2)
+{
+	/* Stock's 41 ns period selects divider 3 with the 61538461 Hz input. */
+	static const unsigned int speeds[] = { 500000, 4000000, 24000000 };
+	unsigned int saved_hz = z2->j98a_probe_hz;
+	unsigned int i;
+	u16 len;
+	u8 status;
+	int error, first_error = 0;
+
+	for (i = 0; i < 3; i++) {
+		z2->j98a_probe_hz = speeds[i];
+		dev_info(&z2->spidev->dev, "J98a independent D3 sample %u/3 at %u Hz requested\n",
+			 i + 1, speeds[i]);
+		error = apple_z2_read_report_info_locked(z2, 0xd3, &status, &len,
+							 "j98a-d3-sample");
+		if (!error && (status || len != 12))
+			error = -EPROTO;
+		if (!error)
+			error = apple_z2_j98a_read_descriptor(z2, 0xd3, len);
+		dev_info(&z2->spidev->dev, "J98a independent D3 sample %u result=%d\n",
+			 i + 1, error);
+		if (error && !first_error)
+			first_error = error;
+		if (i != 2)
+			usleep_range(1000, 1100);
+	}
+	z2->j98a_probe_hz = saved_hz;
+	return first_error;
+}
+
+struct apple_z2_j98a_contact {
+	s32 x;
+	s32 y;
+	u8 id;
+	u8 state;
+};
+
+struct apple_z2_j98a_contacts {
+	struct apple_z2_j98a_contact contact[APPLE_Z2_J172_MAX_CONTACTS];
+	u8 sequence;
+	u8 count;
+};
+
+/* Observed J98a report 0x76 uses the existing version-4 float contact layout. */
+static int apple_z2_j98a_decode_contacts(const u8 *msg, size_t len,
+				       struct apple_z2_j98a_contacts *frame)
+{
+	u8 seen[32] = { };
+	unsigned int offset, bytes, count, i;
+	s64 x, y;
+	const u8 *contact;
+
+	if (len < APPLE_Z2_J172_HEADER_SIZE)
+		return -EMSGSIZE;
+	if (msg[0] != APPLE_Z2_HID_REPORT_ID || msg[3] != 4 ||
+	    !(get_unaligned_le16(msg + 12) & APPLE_Z2_J172_FLOAT_FORMAT))
+		return -EOPNOTSUPP;
+	offset = msg[2] + msg[14];
+	bytes = get_unaligned_le16(msg + 16);
+	count = msg[22];
+	if (msg[2] < APPLE_Z2_J172_HEADER_SIZE ||
+	    count > APPLE_Z2_J172_MAX_CONTACTS ||
+	    bytes != count * APPLE_Z2_J172_CONTACT_SIZE)
+		return -EPROTO;
+	if (offset > len || bytes > len - offset)
+		return -EMSGSIZE;
+	if (bytes != len - offset)
+		return -EPROTO;
+
+	for (i = 0; i < count; i++) {
+		contact = msg + offset + i * APPLE_Z2_J172_CONTACT_SIZE;
+		if (seen[contact[0] / 8] & BIT(contact[0] % 8))
+			return -EPROTO;
+		seen[contact[0] / 8] |= BIT(contact[0] % 8);
+		if (contact[1] != APPLE_Z2_TOUCH_STARTED &&
+		    contact[1] != APPLE_Z2_TOUCH_MOVED && contact[1] != 6)
+			return -EOPNOTSUPP;
+		if (!apple_z2_float_to_integer(contact + 4, &x) ||
+		    !apple_z2_float_to_integer(contact + 8, &y))
+			return -EBADMSG;
+		frame->contact[i].id = contact[0];
+		frame->contact[i].state = contact[1];
+		frame->contact[i].x = x;
+		frame->contact[i].y = y;
+	}
+	frame->sequence = msg[1];
+	frame->count = count;
+	return 0;
+}
+
+/* Inspect checked 0x90 envelopes once per grape report; never emit input. */
+static int apple_z2_j98a_log_contacts(struct apple_z2 *z2, const u8 *data, size_t len,
+				    bool emit)
+{
+	struct apple_z2_j98a_contacts frame;
+	size_t offset = 0;
+	unsigned int i, report_len;
+	int error;
+
+	while (offset < len) {
+		if (len - offset < 4 || data[offset] != 0x90)
+			return -EPROTO;
+		report_len = get_unaligned_le16(data + offset + 2);
+		if (!report_len || report_len > len - offset - 4)
+			return -EMSGSIZE;
+		/* The original K1F18,2 profile assigns grape to interface 1. */
+		if ((data[offset + 1] & BIT(1)) &&
+		    data[offset + 4] == APPLE_Z2_HID_REPORT_ID) {
+			error = apple_z2_j98a_decode_contacts(data + offset + 4,
+						       report_len, &frame);
+			if (error)
+				return error;
+			if (!frame.count)
+				z2->j98a_contact_counts[3]++;
+			if (emit)
+				dev_info(&z2->spidev->dev, "J98a contacts sequence=%u count=%u (raw sensor coordinates)\n",
+					 frame.sequence, frame.count);
+			for (i = 0; i < frame.count; i++) {
+				unsigned int state = frame.contact[i].state;
+
+				z2->j98a_contact_counts[state == 3 ? 0 : state == 4 ? 1 : 2]++;
+				if (emit)
+					dev_info(&z2->spidev->dev,
+						 "J98a contact id=%u state=%u x=%d y=%d\n",
+						 frame.contact[i].id, frame.contact[i].state,
+						 frame.contact[i].x, frame.contact[i].y);
+			}
+		}
+		offset += report_len + 4;
+	}
+	return 0;
+}
+
+/* Stock Z2 readOneFrameOfData, without retries, IRQs or input dispatch. */
+static int apple_z2_j98a_sample_frame(struct apple_z2 *z2, bool *has_frame)
+{
+	struct spi_transfer xfer = {
+		.bits_per_word = 8,
+		.speed_hz = z2->j98a_probe_hz,
+	};
+	u16 announced, payload_len;
+	u8 counter = z2->index_parity + 1;
+	bool trace = !j98a_irq_probe || z2->j98a_trace_frames < 64;
+	size_t wire_len;
+	int error;
+
+	*has_frame = false;
+	error = apple_z2_z2_cmd_locked(z2, APPLE_Z2_CMD_READ_INTERRUPT_DATA,
+				       counter, "j98a-sample-length");
+	if (error)
+		return error;
+	if (z2->rx_buf[0] != APPLE_Z2_REPLY_INTERRUPT_DATA ||
+	    !apple_z2_z2_checksum_valid(z2->rx_buf, APPLE_Z2_CMD_SIZE)) {
+		dev_err(&z2->spidev->dev, "J98a invalid sample length reply: %*ph\n",
+			APPLE_Z2_CMD_SIZE, z2->rx_buf);
+		return -EPROTO;
+	}
+	announced = get_unaligned_le16(z2->rx_buf + 1);
+	/* The runtime diagnostic requires the observed J98a E2 maximum. */
+	if (announced > 8676 || (announced && announced < 2))
+		return -EMSGSIZE;
+	if (!announced)
+		goto next_counter;
+	wire_len = round_up((size_t)announced + 5, 4);
+	if (wire_len > z2->rx_buf_size)
+		return -EMSGSIZE;
+	memset(z2->rx_buf, 0xa5, wire_len);
+	xfer.tx_buf = z2->rx_buf;
+	xfer.rx_buf = z2->rx_buf;
+	xfer.len = wire_len;
+	error = spi_sync_transfer(z2->spidev, &xfer, 1);
+	if (error)
+		return error;
+	apple_z2_post_z2_xfer_delay(z2);
+	payload_len = get_unaligned_le16(z2->rx_buf + 2);
+	if (!payload_len) {
+		u8 sum = z2->rx_buf[0] + z2->rx_buf[1] + z2->rx_buf[2] +
+			 z2->rx_buf[3] + z2->rx_buf[4];
+
+		if ((z2->rx_buf[0] & 0xfe) != 0xea || sum)
+			return -EBADMSG;
+		goto next_counter;
+	}
+	/* Stock validates both checksums but does not require an echoed tag. */
+	if (!apple_z2_gen2_packet_valid(z2->rx_buf, wire_len, counter, false, false))
+		return -EBADMSG;
+	if (payload_len > announced)
+		return -EMSGSIZE;
+	if (payload_len > 2) {
+		/* Kernel %*ph prints at most 64 bytes per conversion. */
+		if (trace)
+			dev_info(&z2->spidev->dev,
+				 "J98a frame tag=%u payload=%u prefix=%*ph\n",
+				 z2->rx_buf[1], payload_len - 2,
+				 min_t(unsigned int, payload_len - 2, 64), z2->rx_buf + 5);
+		if (trace && payload_len - 2 > 64)
+			dev_info(&z2->spidev->dev, "J98a frame continuation offset=64 prefix=%*ph\n",
+				 min_t(unsigned int, payload_len - 2 - 64, 64), z2->rx_buf + 69);
+		error = apple_z2_j98a_log_contacts(z2, z2->rx_buf + 5, payload_len - 2,
+						 trace);
+		if (error)
+			return error;
+		if (trace)
+			z2->j98a_trace_frames++;
+		*has_frame = true;
+	}
+next_counter:
+	/* Stock alternates 1/2 after successful reads, including an empty queue. */
+	z2->index_parity = !z2->index_parity;
+	return 0;
+}
+
+static int apple_z2_j98a_sample_frames(struct apple_z2 *z2)
+{
+	unsigned long deadline = jiffies + msecs_to_jiffies(j98a_runtime_probe_ms);
+	unsigned int polls = 0, frames = 0;
+	bool has_frame;
+	int error = 0;
+
+	z2->index_parity = 0;
+	dev_info(&z2->spidev->dev,
+		 "J98a sampling up to %u ms/300 polls/64 frames; no input dispatch\n",
+		 j98a_runtime_probe_ms);
+	while (time_before(jiffies, deadline) && polls < 300 && frames < 64) {
+		polls++;
+		error = apple_z2_j98a_sample_frame(z2, &has_frame);
+		if (error)
+			break;
+		frames += has_frame;
+		msleep(50);
+	}
+	dev_info(&z2->spidev->dev, "J98a sampling ended: polls=%u frames=%u result=%d\n",
+		 polls, frames, error);
+	return error;
+}
+
+static irqreturn_t apple_z2_j98a_irq(int irq, void *data)
+{
+	struct apple_z2 *z2 = data;
+
+	atomic_inc(&z2->j98a_irq_count);
+	atomic_set(&z2->j98a_irq_pending, 1);
+	wake_up(&z2->j98a_irq_wait);
+	return IRQ_HANDLED;
+}
+
+static int apple_z2_j98a_prepare_irq(struct apple_z2 *z2)
+{
+	struct device *dev = &z2->spidev->dev;
+	int irq;
+
+	if (z2->spidev->irq <= 0 ||
+	    irq_get_trigger_type(z2->spidev->irq) != IRQ_TYPE_EDGE_FALLING)
+		return dev_err_probe(dev, -EINVAL, "J98a diagnostic requires falling-edge IRQ\n");
+	z2->attn_gpio = devm_gpiod_get(dev, "attn", GPIOD_IN);
+	if (IS_ERR(z2->attn_gpio))
+		return dev_err_probe(dev, PTR_ERR(z2->attn_gpio), "J98a ATN GPIO unavailable\n");
+	irq = gpiod_to_irq(z2->attn_gpio);
+	if (irq < 0)
+		return irq;
+	if (irq != z2->spidev->irq || !gpiod_is_active_low(z2->attn_gpio))
+		return dev_err_probe(dev, -EINVAL, "J98a ATN must be the active-low IRQ line\n");
+	init_waitqueue_head(&z2->j98a_irq_wait);
+	atomic_set(&z2->j98a_irq_pending, 0);
+	atomic_set(&z2->j98a_irq_count, 0);
+	return devm_request_irq(dev, irq, apple_z2_j98a_irq, IRQF_NO_AUTOEN,
+				"apple-z2-j98a-test", z2);
+}
+
+/* IRQ events are coalesced; GPIO level alone never drives an unbounded drain. */
+static int apple_z2_j98a_sample_irq_frames(struct apple_z2 *z2)
+{
+	unsigned long deadline;
+	unsigned int reads = 0, frames = 0, pulse_events = 0;
+	bool initial, has_frame;
+	int attn, after, error = 0;
+
+	z2->index_parity = 0;
+	z2->j98a_trace_frames = 0;
+	memset(z2->j98a_contact_counts, 0, sizeof(z2->j98a_contact_counts));
+	atomic_set(&z2->j98a_irq_pending, 0);
+	atomic_set(&z2->j98a_irq_count, 0);
+	dev_info(&z2->spidev->dev,
+		 "J98a IRQ capture up to %u ms/2048 reads; first 64 frames logged; no input\n",
+		 j98a_runtime_probe_ms);
+	deadline = jiffies + msecs_to_jiffies(j98a_runtime_probe_ms);
+	enable_irq(z2->spidev->irq);
+	attn = gpiod_get_value_cansleep(z2->attn_gpio);
+	if (attn < 0) {
+		error = attn;
+		goto disable;
+	}
+	/* Catch one readiness assertion whose falling edge occurred while masked. */
+	initial = attn;
+	dev_info(&z2->spidev->dev, "J98a IRQ capture initial ATN asserted=%d\n", attn);
+	while (time_before(jiffies, deadline) && reads < 2048) {
+		bool pending = atomic_xchg(&z2->j98a_irq_pending, 0);
+
+		if (!initial && !pending) {
+			long remaining = deadline - jiffies;
+
+			if (remaining <= 0)
+				break;
+			if (!wait_event_timeout(z2->j98a_irq_wait,
+					       atomic_read(&z2->j98a_irq_pending),
+					       remaining))
+				break;
+			atomic_xchg(&z2->j98a_irq_pending, 0);
+		}
+		if (!time_before(jiffies, deadline))
+			break;
+		initial = false;
+		attn = gpiod_get_value_cansleep(z2->attn_gpio);
+		if (attn < 0) {
+			error = attn;
+			break;
+		}
+		/* A latched edge remains an event even if the line has returned high. */
+		pulse_events += !attn;
+		reads++;
+		error = apple_z2_j98a_sample_frame(z2, &has_frame);
+		if (error)
+			break;
+		frames += has_frame;
+		after = gpiod_get_value_cansleep(z2->attn_gpio);
+		if (after < 0) {
+			error = after;
+			break;
+		}
+		if (reads <= 64)
+			dev_info(&z2->spidev->dev, "J98a IRQ read=%u ATN before=%d after=%d\n",
+				 reads, attn, after);
+		cond_resched();
+	}
+disable:
+	disable_irq(z2->spidev->irq);
+	dev_info(&z2->spidev->dev,
+		 "J98a IRQ capture ended: edges=%d reads=%u frames=%u released-line-events=%u result=%d\n",
+		 atomic_read(&z2->j98a_irq_count), reads, frames, pulse_events, error);
+	dev_info(&z2->spidev->dev, "J98a contacts total: starts=%u moves=%u lifts=%u empty=%u\n",
+		 z2->j98a_contact_counts[0], z2->j98a_contact_counts[1],
+		 z2->j98a_contact_counts[2], z2->j98a_contact_counts[3]);
+	return error;
+}
+
 /*
  * K1HBPP14 stock sendFirmware/bootSequence, without their retries. Preserve
  * the preconstructed byte stream and its 8-bit wire order. The final RMW
@@ -4472,10 +4893,12 @@ static int apple_z2_j98a_firmware_once(struct apple_z2 *z2,
 				       const struct apple_z2_j98a_firmware *image)
 {
 	static const u8 reports[] = { 0xd1, 0xd3, 0xd9 };
+	static const u16 report_lengths[] = { 1, 12, 16 };
 	struct device *dev = &z2->spidev->dev;
 	struct spi_transfer xfer = { .bits_per_word = 8 };
 	u16 reply, len;
 	u8 status;
+	unsigned int saved_hz = z2->j98a_probe_hz;
 	unsigned int i;
 	int error;
 
@@ -4505,24 +4928,48 @@ static int apple_z2_j98a_firmware_once(struct apple_z2 *z2,
 	z2->protocol_state = APPLE_Z2_STATE_FIRMWARE_READY;
 	z2->z2_inter_packet_delay_us = 125;
 	z2->z2_cs_delay_us = 10;
+	if (j98a_runtime_probe_ms)
+		z2->j98a_probe_hz = APPLE_Z2_J98A_RUNTIME_HZ;
 	error = apple_z2_read_device_info_locked(z2);
 	dev_info(dev, "J98a E2 result=%d reply=%*ph\n", error,
 		 APPLE_Z2_CMD_SIZE, z2->rx_buf);
 	if (error)
-		return error;
+		goto restore_speed;
 	dev_info(dev, "J98a platform=%u interface=%u max-packet=%u\n",
 		 z2->rx_buf[1], z2->rx_buf[2], get_unaligned_le16(z2->rx_buf + 3));
+	if (j98a_runtime_probe_ms && (z2->rx_buf[1] != 24 || z2->rx_buf[2] != 17 ||
+				    get_unaligned_le16(z2->rx_buf + 3) != 8676)) {
+		error = -ENODEV;
+		goto restore_speed;
+	}
 	for (i = 0; i < ARRAY_SIZE(reports); i++) {
 		error = apple_z2_read_report_info_locked(z2, reports[i], &status,
 							 &len, "j98a-metadata");
 		dev_info(dev, "J98a E3 report=%02x result=%d reply=%*ph\n",
 			 reports[i], error, APPLE_Z2_CMD_SIZE, z2->rx_buf);
 		if (error)
-			return error;
-		dev_info(dev, "J98a report=%02x status=%u length=%u (no report read)\n",
+			goto restore_speed;
+		dev_info(dev, "J98a report=%02x status=%u length=%u\n",
 			 reports[i], status, len);
+		if (j98a_runtime_probe_ms) {
+			if (status || len != report_lengths[i]) {
+				error = -EPROTO;
+				goto restore_speed;
+			}
+			error = apple_z2_j98a_read_descriptor(z2, reports[i], len);
+			if (error)
+				goto restore_speed;
+		}
 	}
-	return 0;
+	if (j98a_descriptor_samples)
+		error = apple_z2_j98a_descriptor_sample_set(z2);
+	else if (j98a_irq_probe)
+		error = apple_z2_j98a_sample_irq_frames(z2);
+	else
+		error = j98a_runtime_probe_ms ? apple_z2_j98a_sample_frames(z2) : 0;
+restore_speed:
+	z2->j98a_probe_hz = saved_hz;
+	return error;
 }
 
 /*
@@ -4541,6 +4988,7 @@ static int apple_z2_j98a_probe_once(struct apple_z2 *z2)
 	struct spi_delay cs_setup = z2->spidev->cs_setup;
 	struct spi_delay cs_hold = z2->spidev->cs_hold;
 	struct spi_delay cs_inactive = z2->spidev->cs_inactive;
+	bool irq_requested = false;
 	struct spi_transfer xfer = {
 		.tx_buf = z2->tx_buf,
 		.rx_buf = z2->rx_buf,
@@ -4548,6 +4996,13 @@ static int apple_z2_j98a_probe_once(struct apple_z2 *z2)
 		.bits_per_word = 8,
 	};
 	int error, cleanup_error;
+
+	if (j98a_runtime_probe_ms > 15000 ||
+	    (j98a_irq_probe && !j98a_runtime_probe_ms) ||
+	    (j98a_runtime_probe_ms && j98a_descriptor_samples) ||
+	    ((j98a_runtime_probe_ms || j98a_descriptor_samples) && !j98a_firmware_probe))
+		return dev_err_probe(dev, -EINVAL,
+				     "J98a sampling requires firmware probe and one bounded sampling mode\n");
 
 	if (!z2->power_ana_gpio || !z2->power_ldo_gpio || !z2->clk)
 		return dev_err_probe(dev, -EINVAL,
@@ -4571,7 +5026,6 @@ static int apple_z2_j98a_probe_once(struct apple_z2 *z2)
 	/* The test's bus speed and CS timing are supplied by its disabled DT node. */
 	if ((z2->spidev->mode & SPI_MODE_X_MASK) != SPI_MODE_3)
 		return dev_err_probe(dev, -EINVAL, "J98a probe requires SPI mode 3\n");
-
 	if (j98a_firmware_probe) {
 		error = request_firmware_direct(&fw, APPLE_Z2_J98A_TEST_FIRMWARE, dev);
 		if (error)
@@ -4585,6 +5039,14 @@ static int apple_z2_j98a_probe_once(struct apple_z2 *z2)
 		dev_info(dev, "J98a: one RAM firmware/metadata probe; no input device\n");
 	} else {
 		dev_info(dev, "J98a: one HBPP readiness probe; no firmware upload or input device\n");
+	}
+	if (j98a_irq_probe) {
+		error = apple_z2_j98a_prepare_irq(z2);
+		if (error) {
+			release_firmware(fw);
+			return error;
+		}
+		irq_requested = true;
 	}
 	error = pinctrl_select_state(z2->sync_pinctrl, z2->sync_inactive);
 	if (error)
@@ -4616,6 +5078,8 @@ static int apple_z2_j98a_probe_once(struct apple_z2 *z2)
 	if (!error && j98a_firmware_probe)
 		error = apple_z2_j98a_firmware_once(z2, &image);
 power_off:
+	if (irq_requested)
+		devm_free_irq(dev, z2->spidev->irq, z2);
 	cleanup_error = apple_z2_j98a_power_off(z2);
 	z2->protocol_state = APPLE_Z2_STATE_OFF;
 	z2->spidev->cs_setup = cs_setup;
