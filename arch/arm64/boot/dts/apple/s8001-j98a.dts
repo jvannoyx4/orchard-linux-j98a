@@ -12,4 +12,28 @@
 / {
 	compatible = "apple,j98a", "apple,s8001", "apple,arm-platform";
 	model = "Apple iPad Pro (12.9-inch) (Wi-Fi)";
+
+	aliases {
+		serial5 = &serial5;
+	};
+};
+
+&pinctrl_ap {
+	battery_swi_pins: battery-swi-pins {
+		pinmux = <APPLE_PINMUX(130, 1)>;
+	};
+};
+
+&serial5 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&battery_swi_pins>;
+	status = "okay";
+
+	onewire {
+		compatible = "ti,hdq-uart";
+
+		fuel-gauge {
+			compatible = "ti,bq27540-hdq";
+		};
+	};
 };
