@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * PCIe host bridge driver for Apple H8P/H9P (S8003/T8010/T8015) and A8/A8X
+ * PCIe host bridge driver for Apple H8P/H9P (S8001/S8003/T8010/T8015) and A8/A8X
  * (T7000) SoCs.
  *
  * The controller exposes an ECAM-compatible root complex after the SoC-specific
@@ -276,6 +276,20 @@
 #define S8003_PORT_NVMMU_INV_FIFO_EMPTY	BIT(0)
 #define S8003_NVMMU_INV_FIFO_TIMEOUT_US	20000
 
+/*
+ * AppleS8001PCIe, J98a iPadOS 16.7.16 (20H392) kernelcache:
+ * initCommon 0xfffffff005e70f68, _commonRegOffset 0xfffffff005e710dc,
+ * _enableNVMeMode 0xfffffff005e70e08. S8003's common register offsets
+ * cannot be used on this six-port controller.
+ */
+#define S8001_RC_STAT			0x0028
+#define S8001_RC_COMMON_DONE		0x0034
+#define S8001_RC_PORT_NVME_MODE(p)	(0x0104 + (p) * H9P_RC_PORT_STRIDE)
+#define S8001_RC_PORT_PWR(p)		(0x0124 + (p) * H9P_RC_PORT_STRIDE)
+#define S8001_RC_PORT_REFCLK(p)		(0x0134 + (p) * H9P_RC_PORT_STRIDE)
+#define S8001_RC_PORT_READY(p)		(0x013c + (p) * H9P_RC_PORT_STRIDE)
+#define S8001_LANE_CFG_X2_X1_X1_X1_X1	1
+
 #define H9P_NVMMU_TCB_CTRL		0x0004
 #define H9P_NVMMU_TCB_CTRL_INIT		BIT(16)
 #define T8010_NVMMU_TCB_CTRL_INIT_BUSY	BIT(4)
@@ -494,6 +508,87 @@ static const struct apple_h9p_tunable s8003_port_tunables[] = {
 };
 
 /*
+ * J98a stock iPadOS 16.7.10 IORegistry tunables. These are live values;
+ * the IPSW ADT omits the tables populated by iBoot. All populated ports
+ * (0, 2, 4) carried identical config and port tables.
+ */
+static const struct apple_h9p_tunable s8001_phy_tunables[] = {
+	{ 0x0098, 0x0000000f, 0x00000000 },
+	{ 0x0164, 0x00f8ff00, 0x00000000 },
+	{ 0x08e0, 0x00000001, 0x00000001 },
+	{ 0x0000, 0x0000318c, 0x00002108 },
+	{ 0x0004, 0x0000318c, 0x00002108 },
+};
+
+static const struct apple_h9p_tunable s8001_rc_common_tunables[] = {
+	{ 0x0008, 0x7f7f7f7f, 0x00000000 },
+	{ 0x000c, 0x00073f3f, 0x00043f00 },
+	{ 0x0010, 0x00000700, 0x00000000 },
+	{ 0x0018, 0x00ffffff, 0x000c0960 },
+	{ 0x001c, 0x00001fff, 0x0000092c },
+	{ 0x0024, 0xffffffff, 0x00000000 },
+	{ 0x002c, 0x000000ff, 0x00000009 },
+	{ 0x0100, 0x30100010, 0x00000010 },
+	{ 0x0108, 0x00000010, 0x00000000 },
+	{ 0x010c, 0x00000007, 0x00000000 },
+	{ 0x0110, 0x00073f3f, 0x00043f00 },
+	{ 0x0120, 0x0003003f, 0x0001000f },
+	{ 0x0130, 0x000000ff, 0x0000000f },
+	{ 0x0138, 0x0000007f, 0x0000003e },
+	{ 0x0140, 0x00000707, 0x00000000 },
+	{ 0x0144, 0x00073f3f, 0x00043f00 },
+	{ 0x0180, 0x30100010, 0x00000000 },
+	{ 0x01a0, 0x0003003f, 0x0001000f },
+	{ 0x01b0, 0x000000ff, 0x0000000f },
+	{ 0x01b8, 0x0000007f, 0x0000003e },
+	{ 0x01c0, 0x00000707, 0x00000000 },
+	{ 0x01c4, 0x00073f3f, 0x00043f00 },
+	{ 0x0200, 0x30100010, 0x00000000 },
+	{ 0x0208, 0x00000010, 0x00000000 },
+	{ 0x020c, 0x00000007, 0x00000000 },
+	{ 0x0210, 0x00073f3f, 0x00043f00 },
+	{ 0x0220, 0x0003003f, 0x0001000f },
+	{ 0x0230, 0x000000ff, 0x0000000f },
+	{ 0x0238, 0x0000007f, 0x0000003e },
+	{ 0x0240, 0x00000707, 0x00000000 },
+	{ 0x0244, 0x00073f3f, 0x00043f00 },
+	{ 0x0280, 0x30100010, 0x00000000 },
+	{ 0x02a0, 0x0003003f, 0x0001000f },
+	{ 0x02b0, 0x000000ff, 0x0000000f },
+	{ 0x02b8, 0x0000007f, 0x0000003e },
+	{ 0x02c0, 0x00000707, 0x00000000 },
+	{ 0x02c4, 0x00073f3f, 0x00043f00 },
+	{ 0x0300, 0x30100010, 0x00000000 },
+	{ 0x0320, 0x0003003f, 0x0001000f },
+	{ 0x0330, 0x000000ff, 0x0000000f },
+	{ 0x0338, 0x0000007f, 0x0000003e },
+	{ 0x0340, 0x00000707, 0x00000000 },
+	{ 0x0344, 0x00073f3f, 0x00043f00 },
+	{ 0x0380, 0x30100010, 0x00000000 },
+	{ 0x03a0, 0x0003003f, 0x0001000f },
+	{ 0x03b0, 0x000000ff, 0x0000000f },
+	{ 0x03b8, 0x0000007f, 0x0000003e },
+	{ 0x03c0, 0x00000707, 0x00000000 },
+	{ 0x03c4, 0x00073f3f, 0x00043f00 },
+};
+
+static const struct apple_h9p_tunable s8001_config_tunables[] = {
+	{ 0x0098, 0x0000000f, 0x00000000 },
+	{ 0x0164, 0x00f8ff00, 0x00000000 },
+	{ 0x08e0, 0x00000001, 0x00000001 },
+};
+
+static const struct apple_h9p_tunable s8001_port_tunables[] = {
+	{ 0x0090, 0x000000ff, 0x00000028 },
+	{ 0x0130, 0x00000005, 0x00000005 },
+	{ 0x0134, 0x00000001, 0x00000001 },
+	{ 0x0138, 0x00007f7f, 0x00000000 },
+	{ 0x013c, 0x00000003, 0x00000002 },
+	{ 0x0140, 0x0073ffff, 0x00704c4b },
+	{ 0x0144, 0x0fff0fff, 0x00440089 },
+};
+
+/*
  * T8015 tunables, from the d221 runtime ADT. apcie-phy-tunables go to the
  * "phy" window, apcie-common-tunables to the root complex window,
  * pcie-rc-tunables to the root port's configuration space and
@@ -697,6 +792,7 @@ struct apple_h9p_pcie {
 	struct device_node *port_nodes[H9P_MAX_PORTS];
 	struct device_node *manual_dart[H9P_MAX_PORTS];
 	u32 manual_dart_sid[H9P_MAX_PORTS];
+	u32 active_manual_darts;
 	struct gpio_desc *perst[H9P_MAX_PORTS];
 	struct gpio_desc *clkreq[H9P_MAX_PORTS];
 	struct apple_h9p_port_irq port_irq[H9P_MAX_PORTS];
@@ -2619,6 +2715,74 @@ err_put:
 	return ret;
 }
 
+/*
+ * Only J98a's lane configuration is qualified by the captured hardware
+ * description. Its first two physical lanes form port 0; port 1 must stay
+ * disabled. Unlike S8003, every other port starts at its own lane index.
+ */
+static int apple_s8001_parse(struct apple_h9p_pcie *pcie)
+{
+	struct device *dev = pcie->dev;
+	struct device_node *np;
+	u32 reg, port, lanes;
+	int ret;
+
+	ret = of_property_read_u32(dev->of_node, "apple,lane-cfg", &pcie->lane_cfg);
+	if (ret || pcie->lane_cfg != S8001_LANE_CFG_X2_X1_X1_X1_X1)
+		return dev_err_probe(dev, -EINVAL, "unsupported S8001 lane configuration\n");
+	if (pcie->enabled_ports & BIT(1))
+		return dev_err_probe(dev, -EINVAL, "port 1 is unavailable with port 0 at x2\n");
+
+	for_each_child_of_node(dev->of_node, np) {
+		if (!of_node_name_eq(np, "pci"))
+			continue;
+		ret = of_property_read_u32_index(np, "reg", 0, &reg);
+		if (ret)
+			goto err_put;
+		port = reg >> 11;
+		if (port >= pcie->hw->num_ports) {
+			ret = -EINVAL;
+			goto err_put;
+		}
+		ret = of_property_read_u32(np, "num-lanes", &lanes);
+		if (ret == -EINVAL)
+			ret = 0;
+		else if (!ret && lanes != (port == 0 ? 2 : 1))
+			ret = -EINVAL;
+		if (ret || pcie->max_link_speed[port] > H9P_LINK_SPEED_5GT) {
+			ret = -EINVAL;
+			goto err_put;
+		}
+	}
+
+	return 0;
+
+err_put:
+	dev_err_probe(dev, ret, "%pOF: invalid S8001 port configuration\n", np);
+	of_node_put(np);
+	return ret;
+}
+
+static int apple_s8001_setup_common(struct apple_h9p_pcie *pcie)
+{
+	u32 val;
+	int ret;
+
+	writel(H9P_RC_COMMON_CTL_INIT | pcie->lane_cfg,
+	       pcie->base_rc + S8003_RC_LANE_CFG);
+	h9p_rmw(pcie->base_rc + S8001_RC_PORT_PWR(0), 0, BIT(0));
+	ret = readl_poll_timeout(pcie->base_rc + S8001_RC_STAT, val,
+				val & BIT(0), 10, S8003_READY_TIMEOUT_US);
+	if (ret)
+		return dev_err_probe(pcie->dev, ret, "S8001 common init timeout\n");
+	writel(1, pcie->base_rc + S8001_RC_COMMON_DONE);
+	apple_t7000_write_tunables(pcie->base_phy, pcie->hw->phy_tunables.regs,
+				 pcie->hw->phy_tunables.count);
+	apple_t7000_write_tunables(pcie->base_rc, pcie->hw->common_tunables.regs,
+				 pcie->hw->common_tunables.count);
+	return 0;
+}
+
 /* AppleS8003PCIe common init (initCommon) */
 static int apple_s8003_setup_common(struct apple_h9p_pcie *pcie)
 {
@@ -2783,7 +2947,7 @@ static int apple_s8003_restart_port(struct apple_h9p_pcie *pcie,
 	return 0;
 }
 
-/* AppleS8003PCIe PHY lane init: per physical lane, speed dependent */
+/* AppleS8001PCIe/AppleS8003PCIe PHY init: identical per-lane programming. */
 static void apple_s8003_program_phy_lanes(struct apple_h9p_pcie *pcie,
 					  u32 lane_mask, u32 speed)
 {
@@ -2849,13 +3013,12 @@ static int apple_s8003_wait_link(struct apple_h9p_pcie *pcie,
  * block setup and MSI, PERST# release after 100 ms with a stable reference
  * clock, PHY lanes, then link training.
  */
-static int apple_s8003_start_link(struct apple_h9p_pcie *pcie,
-				  unsigned int port)
+static int apple_s800x_start_link(struct apple_h9p_pcie *pcie,
+				  unsigned int port, u32 lanes)
 {
 	void __iomem *config = pcie->base_config + port * H9P_CFG_PORT_STRIDE;
 	void __iomem *pb = pcie->base_port[port];
 	struct device *dev = pcie->dev;
-	u32 lanes = apple_s8003_lanes(pcie, port);
 	u32 speed = pcie->max_link_speed[port] ?: H9P_LINK_SPEED_2_5GT;
 	u32 val, lnkcap2;
 	u64 cap;
@@ -2918,6 +3081,75 @@ static int apple_s8003_start_link(struct apple_h9p_pcie *pcie,
 	return ret;
 }
 
+/*
+ * AppleS800xPCIePort::enablePortHardware (0xfffffff005e6a3dc) with
+ * AppleS8001PCIe's register map, followed by the S8001 override at
+ * 0xfffffff005e71710. This is one bounded attempt; a failed port aborts
+ * enumeration so downstream bus numbers cannot silently change DARTs.
+ */
+static int apple_s8001_setup_port(struct apple_h9p_pcie *pcie,
+				  unsigned int port,
+				  enum apple_h9p_port_result *result)
+{
+	void __iomem *rc = pcie->base_rc;
+	void __iomem *config = pcie->base_config + port * H9P_CFG_PORT_STRIDE;
+	u32 val, lanes = (port == 0 ? 3 : 1) << port;
+	int ret;
+
+	*result = APPLE_H9P_PORT_DISABLED;
+	ret = gpiod_direction_output(pcie->perst[port], 1);
+	if (ret)
+		return ret;
+
+	if (pcie->hw->nvme_mode_ports & BIT(port)) {
+		writel(0x101, rc + S8003_RC_NVME_MODE0);
+		fsleep(100);
+		writel(1, rc + S8001_RC_PORT_NVME_MODE(port));
+	}
+
+	/* Gate reference clock, power the port, then enable and release reset. */
+	h9p_rmw(rc + S8001_RC_PORT_REFCLK(port), BIT(0), 0);
+	h9p_rmw(rc + S8001_RC_PORT_PWR(port), 0, BIT(0));
+	ret = readl_poll_timeout(rc + S8001_RC_STAT, val, val & BIT(4),
+				10, S8003_READY_TIMEOUT_US);
+	if (ret)
+		return dev_err_probe(pcie->dev, ret, "port %u power timeout\n", port);
+	fsleep(100);
+	h9p_rmw(rc + S8003_RC_PORT_CTL(port), 0, BIT(0));
+	ret = readl_poll_timeout(rc + S8001_RC_PORT_READY(port), val,
+				val & BIT(0), 10, S8003_READY_TIMEOUT_US);
+	if (ret)
+		return dev_err_probe(pcie->dev, ret, "port %u enable timeout\n", port);
+	h9p_rmw(rc + S8003_RC_PORT_CTL(port), BIT(8), 0);
+	fsleep(S8003_REFCLK_TO_PERST_US);
+	h9p_rmw(rc + S8001_RC_PORT_REFCLK(port), 0, BIT(0));
+	readl(rc + S8001_RC_PORT_REFCLK(port));
+
+	/* DART state is restored with the port powered and PERST# still held. */
+	if (pcie->manual_dart[port]) {
+		ret = apple_dart_reload_configuration(pcie->manual_dart[port],
+						      pcie->manual_dart_sid[port]);
+		if (ret)
+			return dev_err_probe(pcie->dev, ret,
+					     "failed to reload port %u DART\n", port);
+		pcie->active_manual_darts |= BIT(port);
+	}
+
+	/* Stop an inherited LTSSM before programming speed, MSI and PHY state. */
+	ret = apple_s8003_port_stop(pcie, port);
+	if (ret)
+		return dev_err_probe(pcie->dev, ret, "port %u stop timeout\n", port);
+	h9p_rmw(config + H9P_CFG_PORT_MISC, 0, BIT(0));
+	ret = apple_s800x_start_link(pcie, port, lanes);
+	if (ret) {
+		gpiod_direction_output(pcie->perst[port], 1);
+		return ret;
+	}
+
+	*result = APPLE_H9P_PORT_READY;
+	return 0;
+}
+
 /* Power the port up as validated for its kind, and train its link once */
 static int apple_s8003_setup_port_once(struct apple_h9p_pcie *pcie,
 				       unsigned int port)
@@ -2938,7 +3170,7 @@ static int apple_s8003_setup_port_once(struct apple_h9p_pcie *pcie,
 	else
 		ret = apple_s8003_restart_port(pcie, port);
 	if (!ret)
-		ret = apple_s8003_start_link(pcie, port);
+		ret = apple_s800x_start_link(pcie, port, apple_s8003_lanes(pcie, port));
 	if (ret)
 		gpiod_direction_output(pcie->perst[port], 1);
 
@@ -3491,6 +3723,28 @@ static void apple_h9p_pcie_pwrctrl_cleanup(void *data)
 	pci_pwrctrl_destroy_devices(pcie->dev);
 }
 
+static void apple_h9p_pcie_manual_dart_cleanup(void *data)
+{
+	struct apple_h9p_pcie *pcie = data;
+	unsigned int port;
+	int ret;
+
+	/* Runs on probe failure too, before host clocks/domains are released. */
+	for (port = 0; port < pcie->hw->num_ports; port++) {
+		if (!(pcie->active_manual_darts & BIT(port)))
+			continue;
+		h9p_rmw(pcie->base_port[port] + H9P_PORT_LTSSMCTL,
+			H9P_PORT_LTSSM_ENABLE, 0);
+		readl(pcie->base_port[port] + H9P_PORT_LTSSMCTL);
+		gpiod_direction_output(pcie->perst[port], 1);
+		ret = apple_dart_set_unavailable(pcie->manual_dart[port]);
+		if (ret)
+			dev_warn(pcie->dev, "port %u DART teardown failed: %d\n",
+				 port, ret);
+	}
+	pcie->active_manual_darts = 0;
+}
+
 static int apple_h9p_pcie_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -3642,6 +3896,10 @@ static int apple_h9p_pcie_probe(struct platform_device *pdev)
 	ret = devm_add_action_or_reset(dev, apple_h9p_pcie_msi_cleanup, pcie);
 	if (ret)
 		return ret;
+	ret = devm_add_action_or_reset(dev, apple_h9p_pcie_manual_dart_cleanup,
+				       pcie);
+	if (ret)
+		return ret;
 
 	INIT_DELAYED_WORK(&pcie->late_work, apple_s8003_late_ports_work);
 	ret = devm_add_action_or_reset(dev, apple_h9p_pcie_cancel_late_ports,
@@ -3657,6 +3915,31 @@ static int apple_h9p_pcie_probe(struct platform_device *pdev)
 		schedule_delayed_work(&pcie->late_work,
 				      msecs_to_jiffies(S8003_LATE_PORT_RETRY_MS));
 	return 0;
+}
+
+static void apple_h9p_pcie_remove(struct platform_device *pdev)
+{
+	struct apple_h9p_pcie *pcie = apple_h9p_pcie_lookup(&pdev->dev);
+	unsigned int port;
+
+	/* A late rescan must not race removal of the downstream devices. */
+	cancel_delayed_work_sync(&pcie->late_work);
+	pci_lock_rescan_remove();
+	/* Drivers must finish their shutdown transactions while links work. */
+	pci_stop_root_bus(pcie->bridge->bus);
+	/* Stop endpoint DMA before removing devices and their IOMMU domains. */
+	for (port = 0; port < pcie->hw->num_ports; port++) {
+		if (!(pcie->enabled_ports & BIT(port)))
+			continue;
+		apple_h9p_disable_port_irq(pcie, port);
+		h9p_rmw(pcie->base_port[port] + H9P_PORT_LTSSMCTL,
+			H9P_PORT_LTSSM_ENABLE, 0);
+		readl(pcie->base_port[port] + H9P_PORT_LTSSMCTL);
+		gpiod_direction_output(pcie->perst[port], 1);
+	}
+	pci_remove_root_bus(pcie->bridge->bus);
+	pci_unlock_rescan_remove();
+	/* Managed cleanup now releases MSI, endpoint power, clocks and domains. */
 }
 
 static const struct apple_h9p_hw apple_h9p_hw_t7000 = {
@@ -3708,6 +3991,26 @@ static const struct apple_h9p_hw apple_h9p_hw_t8015 = {
 	.port_tunables = H9P_TUNABLES(t8015_port_tunables),
 };
 
+static const struct apple_h9p_hw apple_h9p_hw_s8001 = {
+	.num_ports = 6,
+	.parse = apple_s8001_parse,
+	.setup_common = apple_s8001_setup_common,
+	.setup_port = apple_s8001_setup_port,
+	.nvme_mode_ports = BIT(0),
+	.link_settle_ms = 100,
+	.has_phy = true,
+	.has_nvmmu = true,
+	.phy_tunables = H9P_TUNABLES(s8001_phy_tunables),
+	.common_tunables = H9P_TUNABLES(s8001_rc_common_tunables),
+	.config_tunables = H9P_TUNABLES(s8001_config_tunables),
+	.port_tunables = H9P_TUNABLES(s8001_port_tunables),
+	/* Shared AppleNVMeMMU: init polls bit 16, J98a has the FIFO workaround. */
+	.nvmmu_init_busy = H9P_NVMMU_TCB_CTRL_INIT,
+	.nvmmu_inv_fifo = true,
+	.nvmmu_optional = true,
+	.no_port_irqs = true,
+};
+
 static const struct apple_h9p_hw apple_h9p_hw_s8003 = {
 	.num_ports = 4,
 	.parse = apple_s8003_parse,
@@ -3729,6 +4032,7 @@ static const struct apple_h9p_hw apple_h9p_hw_s8003 = {
 };
 
 static const struct of_device_id apple_h9p_pcie_of_match[] = {
+	{ .compatible = "apple,s8001-pcie", .data = &apple_h9p_hw_s8001 },
 	{ .compatible = "apple,s8003-pcie", .data = &apple_h9p_hw_s8003 },
 	{ .compatible = "apple,j172-pcie", .data = &apple_h9p_hw_j172 },
 	{ .compatible = "apple,t8015-pcie", .data = &apple_h9p_hw_t8015 },
@@ -3740,6 +4044,7 @@ MODULE_DEVICE_TABLE(of, apple_h9p_pcie_of_match);
 
 static struct platform_driver apple_h9p_pcie_driver = {
 	.probe = apple_h9p_pcie_probe,
+	.remove = apple_h9p_pcie_remove,
 	.driver = {
 		.name = "pcie-apple-h9p",
 		.of_match_table = apple_h9p_pcie_of_match,
@@ -3748,7 +4053,7 @@ static struct platform_driver apple_h9p_pcie_driver = {
 };
 module_platform_driver(apple_h9p_pcie_driver);
 
-MODULE_DESCRIPTION("Apple H8P/H9P (S8003/T8010) and T7000 PCIe host bridge driver");
+MODULE_DESCRIPTION("Apple H8P/H9P (S8001/S8003/T8010/T8015) and T7000 PCIe host bridge driver");
 MODULE_LICENSE("GPL");
 
 #ifdef CONFIG_PCIE_APPLE_H9P_KUNIT_TEST
