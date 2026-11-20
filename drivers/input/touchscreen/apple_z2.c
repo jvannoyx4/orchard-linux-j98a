@@ -68,6 +68,7 @@
 #define APPLE_Z2_HBPP_CMD_BLOB           0x3001
 #define APPLE_Z2_FW_MAGIC                0x5746325A
 #define APPLE_Z2_RX_BUF_SIZE             8192
+#define APPLE_Z2_RX_BUF_MAX              16384
 #define APPLE_Z2_D111_CAL_SIZE           0x400
 #define LOAD_COMMAND_INIT_PAYLOAD        0
 #define LOAD_COMMAND_SEND_BLOB           1
@@ -138,6 +139,7 @@ enum apple_z2_protocol_state {
 
 enum apple_z2_variant {
 	APPLE_Z2_VARIANT_GENERIC,
+	APPLE_Z2_VARIANT_J98A_PROBE,
 	APPLE_Z2_VARIANT_J172,
 	APPLE_Z2_VARIANT_J71B,
 	APPLE_Z2_VARIANT_J71T,
@@ -145,6 +147,11 @@ enum apple_z2_variant {
 	APPLE_Z2_VARIANT_D111,
 	APPLE_Z2_VARIANT_N61,
 };
+
+static bool j98a_probe;
+module_param(j98a_probe, bool, 0400);
+MODULE_PARM_DESC(j98a_probe,
+		"Run one J98a HBPP readiness probe without firmware or input");
 
 struct apple_z2_hbpp_reg {
 	u32 addr;
@@ -286,6 +293,7 @@ struct apple_z2 {
 	const char *fw_name;
 	u8 *tx_buf;
 	u8 *rx_buf;
+	size_t rx_buf_size;
 };
 
 static bool apple_z2_uses_ipad_protocol(const struct apple_z2 *z2)
@@ -297,6 +305,11 @@ static bool apple_z2_uses_ipad_protocol(const struct apple_z2 *z2)
 static bool apple_z2_is_j71b(const struct apple_z2 *z2)
 {
 	return z2->variant == APPLE_Z2_VARIANT_J71B;
+}
+
+static bool apple_z2_is_j98a_probe(const struct apple_z2 *z2)
+{
+	return z2->variant == APPLE_Z2_VARIANT_J98A_PROBE;
 }
 
 static bool apple_z2_is_n61(const struct apple_z2 *z2)
@@ -843,7 +856,7 @@ static int apple_z2_gen1_exchange(struct apple_z2 *z2, u8 *buf, size_t len)
 	u8 *tx;
 	int error, restore;
 
-	if (!len || len > APPLE_Z2_RX_BUF_SIZE)
+	if (!len || len > z2->rx_buf_size)
 		return -EMSGSIZE;
 	if (apple_z2_uses_gen1_data(z2))
 		xfer.speed_hz = 500000;
@@ -946,7 +959,7 @@ data_phase:
 		pkt_len = max_t(size_t, 16, (size_t)payload_len + 5);
 	else
 		pkt_len = (payload_len + 8) & 0xfffffffc;
-	if (pkt_len > APPLE_Z2_RX_BUF_SIZE) {
+	if (pkt_len > z2->rx_buf_size) {
 		dev_warn(&z2->spidev->dev, "packet too large: %zu\n", pkt_len);
 		return -EMSGSIZE;
 	}
@@ -1220,6 +1233,28 @@ static int apple_z2_z2_cmd_locked(struct apple_z2 *z2, u8 cmd, u8 report,
 	return apple_z2_z2_cmd_locked_delay(z2, cmd, report, tag, true);
 }
 
+/* Called with IRQs masked, before runtime can use the receive buffer. */
+static int apple_z2_grow_rx_buffer(struct apple_z2 *z2, u16 max_packet_size)
+{
+	size_t size;
+	u8 *buf;
+
+	/* E2 describes the payload; reserve its framing and word padding. */
+	if (max_packet_size < APPLE_Z2_CMD_SIZE ||
+	    max_packet_size > APPLE_Z2_RX_BUF_MAX - 8)
+		return -EMSGSIZE;
+	size = round_up((size_t)max_packet_size + 8, 4);
+	if (size <= z2->rx_buf_size)
+		return 0;
+
+	buf = devm_krealloc(&z2->spidev->dev, z2->rx_buf, size, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+	z2->rx_buf = buf;
+	z2->rx_buf_size = size;
+	return 0;
+}
+
 static int apple_z2_read_device_info_locked(struct apple_z2 *z2)
 {
 	u16 max_packet_size;
@@ -1251,6 +1286,11 @@ static int apple_z2_read_device_info_locked(struct apple_z2 *z2)
 	platform_id = z2->rx_buf[1];
 	interface_version = z2->rx_buf[2];
 	max_packet_size = get_unaligned_le16(z2->rx_buf + 3);
+	error = apple_z2_grow_rx_buffer(z2, max_packet_size);
+	if (error)
+		return dev_err_probe(&z2->spidev->dev, error,
+				     "cannot receive advertised packet size %u\n",
+				     max_packet_size);
 
 	dev_dbg(&z2->spidev->dev,
 		"device info: platform=%u interface=%u max-packet=%u\n",
@@ -1341,7 +1381,7 @@ static int apple_z2_read_report_locked(struct apple_z2 *z2, u8 report,
 	unsigned int data_len;
 	int error;
 
-	if (!len || len > APPLE_Z2_RX_BUF_SIZE - 5)
+	if (!len || len > z2->rx_buf_size - 5)
 		return -EMSGSIZE;
 
 	memset(z2->tx_buf, 0, APPLE_Z2_CMD_SIZE);
@@ -1531,7 +1571,7 @@ static int apple_z2_n1_device_info_locked(struct apple_z2 *z2)
 
 	max_packet_size = get_unaligned_le16(z2->rx_buf + 3);
 	if (z2->rx_buf[2] != n1->interface || max_packet_size < 16 ||
-	    max_packet_size > APPLE_Z2_RX_BUF_SIZE - 5) {
+	    max_packet_size > z2->rx_buf_size - 5) {
 		dev_err(&z2->spidev->dev,
 			"unexpected interface %u, max packet %u\n",
 			z2->rx_buf[2], max_packet_size);
@@ -2388,9 +2428,37 @@ reclaim_gpios:
 	return error;
 }
 
+static int apple_z2_j98a_power_off(struct apple_z2 *z2)
+{
+	int error = 0;
+
+	gpiod_set_value_cansleep(z2->reset_gpio, 1);
+	if (z2->clk_enabled) {
+		clk_disable_unprepare(z2->clk);
+		z2->clk_enabled = false;
+	}
+	if (z2->sync_pinctrl) {
+		error = pinctrl_select_state(z2->sync_pinctrl,
+					     z2->sync_inactive);
+		if (error)
+			dev_warn(&z2->spidev->dev,
+				 "failed to restore J98a display-sync: %d\n", error);
+	}
+	apple_z2_set_gpio(z2->power_ldo_gpio, 0);
+	apple_z2_set_gpio(z2->power_ana_gpio, 0);
+	msleep(10);
+	z2->platform_powered = false;
+	return error;
+}
+
 static void apple_z2_platform_power_off(struct apple_z2 *z2)
 {
 	int error;
+
+	if (apple_z2_is_j98a_probe(z2)) {
+		apple_z2_j98a_power_off(z2);
+		return;
+	}
 
 	if (apple_z2_is_gen1(z2))
 		apple_z2_gen1_restore_irq_type(z2);
@@ -3493,7 +3561,7 @@ static int apple_z2_apply_fw_config(struct apple_z2 *z2, const u8 *data,
 			   apple_z2_fw_config_word(data, 10) : 0;
 	if ((valid & APPLE_Z2_FW_CONFIG_MIN_DMA) && min_dma) {
 		if (apple_z2_is_iphone7_plus(z2)) {
-			if (min_dma > APPLE_Z2_RX_BUF_SIZE)
+			if (min_dma > z2->rx_buf_size)
 				return -EINVAL;
 			z2->dma_min_len = min_dma;
 		} else if (apple_z2_is_j71b(z2)) {
@@ -4271,6 +4339,88 @@ static const struct apple_z2_chip_info apple_z2_n61_info = {
 	.cs_inactive_us = 1000,
 };
 
+static const struct apple_z2_chip_info apple_z2_j98a_probe_info = {
+	.name = "J98a HBPP probe (no input support)",
+	.variant = APPLE_Z2_VARIANT_J98A_PROBE,
+};
+
+/*
+ * The stock J98a power sequence enables analog and LDO, then peripheral
+ * display sync and a 10 ms delay. Its HID transport's default reset sequence
+ * asserts and releases reset for 1 ms each. The PMGR clock uses 8/100 us
+ * enable/disable delays and a 24 MHz reference. This probe establishes only
+ * HBPP readiness; clock placement and SPI timing still need a hardware test.
+ */
+static int apple_z2_j98a_probe_once(struct apple_z2 *z2)
+{
+	struct device *dev = &z2->spidev->dev;
+	struct spi_transfer xfer = {
+		.tx_buf = z2->tx_buf,
+		.rx_buf = z2->rx_buf,
+		.len = 4,
+		.bits_per_word = 8,
+	};
+	int error, cleanup_error;
+
+	if (!z2->power_ana_gpio || !z2->power_ldo_gpio || !z2->clk)
+		return dev_err_probe(dev, -EINVAL,
+				     "J98a probe needs both power GPIOs and clock\n");
+
+	z2->sync_pinctrl = devm_pinctrl_get(dev);
+	if (IS_ERR(z2->sync_pinctrl))
+		return dev_err_probe(dev, PTR_ERR(z2->sync_pinctrl),
+				     "J98a probe needs display-sync pinctrl\n");
+	z2->sync_active = pinctrl_lookup_state(z2->sync_pinctrl,
+					       "display-sync-active");
+	if (IS_ERR(z2->sync_active))
+		return dev_err_probe(dev, PTR_ERR(z2->sync_active),
+				     "missing display-sync-active\n");
+	z2->sync_inactive = pinctrl_lookup_state(z2->sync_pinctrl,
+						 "display-sync-inactive");
+	if (IS_ERR(z2->sync_inactive))
+		return dev_err_probe(dev, PTR_ERR(z2->sync_inactive),
+				     "missing display-sync-inactive\n");
+
+	/* The test's bus speed and CS timing are supplied by its disabled DT node. */
+	if ((z2->spidev->mode & SPI_MODE_X_MASK) != SPI_MODE_3)
+		return dev_err_probe(dev, -EINVAL, "J98a probe requires SPI mode 3\n");
+
+	dev_info(dev, "J98a: one HBPP readiness probe; no firmware upload or input device\n");
+	error = pinctrl_select_state(z2->sync_pinctrl, z2->sync_inactive);
+	if (error)
+		goto power_off;
+	gpiod_set_value_cansleep(z2->reset_gpio, 1);
+	usleep_range(1000, 2000);
+	apple_z2_set_gpio(z2->power_ana_gpio, 1);
+	apple_z2_set_gpio(z2->power_ldo_gpio, 1);
+	error = pinctrl_select_state(z2->sync_pinctrl, z2->sync_active);
+	if (error)
+		goto power_off;
+	msleep(10);
+	error = apple_z2_enable_clock(z2);
+	if (error)
+		goto power_off;
+	gpiod_set_value_cansleep(z2->reset_gpio, 0);
+	/* Wait the profile's normal boot timeout before the single exchange. */
+	msleep(500);
+	memcpy(z2->tx_buf, "\x1a\xa1\x18\xe1", xfer.len);
+	memset(z2->rx_buf, 0, xfer.len);
+	error = spi_sync_transfer(z2->spidev, &xfer, 1);
+	if (error) {
+		dev_err(dev, "J98a HBPP transfer failed: %d\n", error);
+	} else {
+		dev_info(dev, "J98a HBPP readiness response: %*ph\n", 4, z2->rx_buf);
+		if (z2->rx_buf[0] != 0x1f || z2->rx_buf[1] != 0x01)
+			error = -EPROTO;
+	}
+power_off:
+	cleanup_error = apple_z2_j98a_power_off(z2);
+	if (!error)
+		error = cleanup_error;
+	dev_info(dev, "J98a probe ended (%d); controller powered down\n", error);
+	return error;
+}
+
 static int apple_z2_probe(struct spi_device *spi)
 {
 	struct device *dev = &spi->dev;
@@ -4284,6 +4434,9 @@ static int apple_z2_probe(struct spi_device *spi)
 	info = spi_get_device_match_data(spi);
 	if (!info)
 		return -ENODEV;
+	if (info->variant == APPLE_Z2_VARIANT_J98A_PROBE && !j98a_probe)
+		return dev_err_probe(dev, -ENODEV,
+				     "J98a test disabled; set j98a_probe=1 for one readiness probe\n");
 
 	z2 = devm_kzalloc(dev, sizeof(*z2), GFP_KERNEL);
 	if (!z2)
@@ -4295,6 +4448,7 @@ static int apple_z2_probe(struct spi_device *spi)
 	z2->rx_buf = devm_kzalloc(dev, APPLE_Z2_RX_BUF_SIZE, GFP_KERNEL);
 	if (!z2->rx_buf)
 		return -ENOMEM;
+	z2->rx_buf_size = APPLE_Z2_RX_BUF_SIZE;
 
 	z2->spidev = spi;
 	z2->info = info;
@@ -4412,6 +4566,8 @@ static int apple_z2_probe(struct spi_device *spi)
 	if (IS_ERR(z2->clk))
 		return dev_err_probe(dev, PTR_ERR(z2->clk),
 				     "unable to get clock\n");
+	if (apple_z2_is_j98a_probe(z2))
+		return apple_z2_j98a_probe_once(z2);
 
 	error = devm_request_threaded_irq(dev, spi->irq, NULL, apple_z2_irq,
 					  IRQF_ONESHOT | IRQF_NO_AUTOEN,
@@ -4595,6 +4751,10 @@ static int apple_z2_resume(struct device *dev)
 {
 	struct apple_z2 *z2 = spi_get_drvdata(to_spi_device(dev));
 
+	/* The diagnostic is run only by an explicit bind, never by resume. */
+	if (apple_z2_is_j98a_probe(z2))
+		return 0;
+
 	z2->stopping = false;
 	z2->recovering = false;
 	z2->boot_due = true;
@@ -4606,7 +4766,7 @@ static void __maybe_unused apple_z2_complete(struct device *dev)
 {
 	struct apple_z2 *z2 = spi_get_drvdata(to_spi_device(dev));
 
-	if (!z2->boot_due)
+	if (apple_z2_is_j98a_probe(z2) || !z2->boot_due)
 		return;
 	z2->boot_due = false;
 	queue_work(system_unbound_wq, &z2->resume_work);
@@ -4618,6 +4778,7 @@ static const struct dev_pm_ops apple_z2_pm = {
 };
 
 static const struct of_device_id apple_z2_of_match[] = {
+	{ .compatible = "apple,j98a-touchscreen", .data = &apple_z2_j98a_probe_info },
 	{ .compatible = "apple,j293-touchbar", .data = &apple_z2_j293_info },
 	{ .compatible = "apple,j493-touchbar", .data = &apple_z2_j493_info },
 	{ .compatible = "apple,j71b-touchscreen", .data = &apple_z2_j71b_info },
@@ -4633,6 +4794,7 @@ static const struct of_device_id apple_z2_of_match[] = {
 MODULE_DEVICE_TABLE(of, apple_z2_of_match);
 
 static struct spi_device_id apple_z2_of_id[] = {
+	{ .name = "j98a-touchscreen", .driver_data = (kernel_ulong_t)&apple_z2_j98a_probe_info },
 	{ .name = "j293-touchbar", .driver_data = (kernel_ulong_t)&apple_z2_j293_info },
 	{ .name = "j493-touchbar", .driver_data = (kernel_ulong_t)&apple_z2_j493_info },
 	{ .name = "j71b-touchscreen", .driver_data = (kernel_ulong_t)&apple_z2_j71b_info },
