@@ -35,6 +35,7 @@
 		serial3 = &serial3;
 		serial5 = &serial5;
 		touchscreen0 = &touchscreen0;
+		wifi0 = &wifi0;
 	};
 };
 
@@ -94,6 +95,7 @@
 	pcie_wifi: pci@2,0 {
 		device_type = "pci";
 		reg = <0x1000 0x0 0x0 0x0 0x0>;
+		bus-range = <1 1>;
 		reset-gpios = <&pinctrl_ap 100 GPIO_ACTIVE_LOW>;
 		num-lanes = <1>;
 		max-link-speed = <1>;
@@ -105,6 +107,12 @@
 		#size-cells = <2>;
 		ranges;
 		status = "disabled";
+
+		wifi0: wifi@0,0 {
+			compatible = "pci14e4,43a3";
+			reg = <0x10000 0x0 0x0 0x0 0x0>;
+			/* m1n1 supplies the factory MAC and calibration at boot. */
+		};
 	};
 };
 
