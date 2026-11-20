@@ -17,6 +17,17 @@ allOf:
       properties:
         dmas: false
         dma-names: false
+  - if:
+      not:
+        properties:
+          compatible:
+            contains:
+              const: apple,s8001-spi
+    then:
+      patternProperties:
+        "@[0-9a-f]+$":
+          properties:
+            apple,half-clock-delay: false
 
 maintainers:
   - Hector Martin <marcan@marcan.st>

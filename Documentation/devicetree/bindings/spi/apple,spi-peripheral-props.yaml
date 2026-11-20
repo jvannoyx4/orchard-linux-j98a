@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/spi/apple,spi-peripheral-props.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Peripheral-specific properties for Apple SPI controllers
+
+maintainers:
+  - Paul Praschl <praschlpaul@g-p.at>
+
+select: false
+
+properties:
+  apple,half-clock-delay:
+    type: boolean
+    description:
+      Enable the SPI controller's half-clock-delay timing for this peripheral.
+      On S8001 this sets configuration bit 20 and requires an inter-word delay
+      of at least two controller input clocks. Longer requested word delays
+      are preserved. This flag is independent of clock polarity and phase.
+      Supported on S8001 with 8-bit transfers.
+
+additionalProperties: true
+...

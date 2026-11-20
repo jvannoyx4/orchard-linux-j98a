@@ -150,6 +150,7 @@ properties:
 
 # The controller specific properties go here.
 allOf:
+  - $ref: apple,spi-peripheral-props.yaml#
   - $ref: arm,pl022-peripheral-props.yaml#
   - $ref: cdns,qspi-nor-peripheral-props.yaml#
   - $ref: fsl,dspi-peripheral-props.yaml#

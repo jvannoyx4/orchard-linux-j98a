@@ -82,6 +82,15 @@ properties:
       Value of the diagnostic configuration register, from the Apple device
       tree property "diag-config" of the same DART.
 
+  apple,manual-availability:
+    type: boolean
+    description:
+      The legacy DART is inside a PCIe port whose registers are inaccessible
+      until the host completes the port power sequence. Register the IOMMU
+      without accessing its hardware or enabling its fault interrupt, and
+      wait for the host to signal availability before initializing it.
+      Corresponds to the Apple device tree property "manual-availability".
+
 required:
   - compatible
   - reg
@@ -100,6 +109,7 @@ allOf:
         apple,error-reflector: false
         apple,fetch-config: false
         apple,diag-config: false
+        apple,manual-availability: false
 
 additionalProperties: false
 

@@ -21,6 +21,7 @@ properties:
       - apple,j71t-touchscreen
       - apple,j81-touchscreen
       - apple,j96-touchscreen
+      - apple,j98a-touchscreen
       - apple,j172-touchscreen
       - apple,d11-touchscreen
       - apple,d111-touchscreen
@@ -67,9 +68,6 @@ properties:
 
   clocks:
     maxItems: 1
-
-  ana-supply:
-    description: N61 analog touchscreen supply from the Chestnut high-voltage switch
 
   apple,z2-prox-cal-blob:
     $ref: /schemas/types.yaml#/definitions/uint8-array
@@ -149,15 +147,41 @@ properties:
 
 required:
   - compatible
-  - interrupts
   - reset-gpios
-  - firmware-name
-  - touchscreen-size-x
-  - touchscreen-size-y
 
 allOf:
   - $ref: touchscreen.yaml#
   - $ref: /schemas/spi/spi-peripheral-props.yaml#
+  - if:
+      properties:
+        compatible:
+          const: apple,j98a-touchscreen
+    then:
+      description:
+        J98a currently supports only an explicitly requested HBPP readiness
+        probe. Firmware loading, interrupts and input reports are not enabled.
+      properties:
+        pinctrl-names:
+          items:
+            - const: display-sync-active
+            - const: display-sync-inactive
+        display-sync-gpios: false
+        display-sync1-gpios: false
+      required:
+        - clocks
+        - power-ana-gpios
+        - power-ldo-gpios
+        - pinctrl-0
+        - pinctrl-1
+        - pinctrl-names
+        - spi-cpha
+        - spi-cpol
+    else:
+      required:
+        - interrupts
+        - firmware-name
+        - touchscreen-size-x
+        - touchscreen-size-y
   - if:
       properties:
         compatible:

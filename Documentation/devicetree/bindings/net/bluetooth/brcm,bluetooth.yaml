@@ -32,6 +32,7 @@ properties:
           - const: brcm,bcm4329-bt
       - enum:
           - apple,j81-bcm4350c2-bt
+          - apple,j98a-bcm4350c5-bt
           - brcm,bcm20702a1
           - brcm,bcm4329-bt
           - brcm,bcm4330-bt
@@ -121,6 +122,14 @@ properties:
       Set this property if autobaud mode is required. Autobaud mode is required
       if the device's initial baud rate in normal mode is not supported by the
       host or if the device requires autobaud mode startup before loading FW.
+
+  apple,wlan:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      The Wi-Fi function of the same Apple module. Apple fits modules from
+      several vendors, each needing its own Patchram, and only the Wi-Fi
+      function can read the module vendor from its OTP. The Patchram is
+      chosen by the vendor that the Wi-Fi driver reads.
 
   interrupts:
     items:
