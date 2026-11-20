@@ -10,9 +10,15 @@ struct device_node;
 
 #if IS_REACHABLE(CONFIG_APPLE_DART)
 int apple_dart_reload_configuration(struct device_node *np, u32 sid);
+int apple_dart_set_unavailable(struct device_node *np);
 #else
 static inline int apple_dart_reload_configuration(struct device_node *np,
 						  u32 sid)
+{
+	return -ENODEV;
+}
+
+static inline int apple_dart_set_unavailable(struct device_node *np)
 {
 	return -ENODEV;
 }

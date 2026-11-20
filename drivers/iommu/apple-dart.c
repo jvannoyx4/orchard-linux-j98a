@@ -222,6 +222,9 @@ struct apple_dart {
 	void __iomem *regs;
 
 	int irq;
+	bool irq_requested;
+	bool manual_availability;
+	bool available;
 	struct clk_bulk_data *clks;
 	int num_clks;
 
@@ -289,6 +292,33 @@ struct apple_dart_hw {
 	/* S5L8960X family: map leaves without no-read/no-write bits */
 	bool no_perms;
 };
+
+static bool apple_dart_is_available(struct apple_dart *dart)
+{
+	/* Pair with publication after hardware initialization and IRQ setup. */
+	return !dart->manual_availability || smp_load_acquire(&dart->available);
+}
+
+static irqreturn_t apple_dart_irq(int irq, void *data)
+{
+	struct apple_dart *dart = data;
+
+	if (!apple_dart_is_available(dart))
+		return IRQ_NONE;
+	return dart->hw->irq_handler(irq, data);
+}
+
+static int apple_dart_request_irq(struct apple_dart *dart)
+{
+	int ret;
+
+	ret = request_irq(dart->irq, apple_dart_irq, IRQF_SHARED,
+			  "apple-dart fault handler", dart);
+	if (!ret)
+		dart->irq_requested = true;
+	return ret;
+}
+
 
 /*
  * Convenience struct to identify streams.
@@ -375,6 +405,17 @@ struct apple_dart_master_cfg {
 
 static struct platform_driver apple_dart_driver;
 static const struct iommu_ops apple_dart_iommu_ops;
+
+static int apple_dart_check_available(struct apple_dart_master_cfg *cfg)
+{
+	struct apple_dart_stream_map *stream_map;
+	int i;
+
+	for_each_stream_map(i, cfg, stream_map)
+		if (!apple_dart_is_available(stream_map->dart))
+			return -EPROBE_DEFER;
+	return 0;
+}
 
 static struct apple_dart_domain *to_dart_domain(struct iommu_domain *dom)
 {
@@ -764,6 +805,7 @@ int apple_dart_reload_configuration(struct device_node *np, u32 sid)
 	if (!pdev)
 		return -EPROBE_DEFER;
 
+	device_lock(&pdev->dev);
 	dart = platform_get_drvdata(pdev);
 	if (!dart) {
 		ret = -EPROBE_DEFER;
@@ -779,17 +821,73 @@ int apple_dart_reload_configuration(struct device_node *np, u32 sid)
 	}
 
 	mutex_lock(&apple_dart_groups_lock);
-	if (dart->sid2group[sid])
+	if (dart->sid2group[sid]) {
 		ret = -EBUSY;
-	else
+	} else if (!apple_dart_is_available(dart)) {
+		/* The PCIe host has powered the port and still holds PERST#. */
+		ret = apple_dart_hw_reset(dart);
+		if (!ret)
+			ret = apple_dart_s5l8960x_reload_configuration(dart, sid);
+		if (!ret)
+			ret = apple_dart_request_irq(dart);
+		if (!ret) {
+			/* Publish initialized registers/IRQ before permitting clients. */
+			smp_store_release(&dart->available, true);
+		} else {
+			/* Keep all streams blocked if activation did not complete. */
+			apple_dart_hw_reset(dart);
+		}
+	} else {
 		ret = apple_dart_s5l8960x_reload_configuration(dart, sid);
+	}
 	mutex_unlock(&apple_dart_groups_lock);
 
 out_put_device:
+	device_unlock(&pdev->dev);
 	put_device(&pdev->dev);
 	return ret;
 }
 EXPORT_SYMBOL_GPL(apple_dart_reload_configuration);
+
+/*
+ * The host must detach all IOMMU clients, hold every downstream master in
+ * reset, and keep the port's clocks/power on until this returns. This is
+ * teardown, not runtime PM: it does not drain clients' map/flush callbacks.
+ * Used only by manual-availability DARTs.
+ */
+int apple_dart_set_unavailable(struct device_node *np)
+{
+	struct platform_device *pdev;
+	struct apple_dart *dart;
+	int ret = 0;
+
+	pdev = of_find_device_by_node(np);
+	if (!pdev)
+		return -ENODEV;
+	device_lock(&pdev->dev);
+	dart = platform_get_drvdata(pdev);
+	if (!dart) {
+		ret = -ENODEV;
+		goto out;
+	}
+	if (!dart->manual_availability || !apple_dart_is_available(dart))
+		goto out;
+
+	mutex_lock(&apple_dart_groups_lock);
+	/* Gate new clients/IRQ work before synchronizing and clearing hardware. */
+	smp_store_release(&dart->available, false);
+	if (dart->irq_requested) {
+		free_irq(dart->irq, dart);
+		dart->irq_requested = false;
+	}
+	ret = apple_dart_hw_reset(dart);
+	mutex_unlock(&apple_dart_groups_lock);
+out:
+	device_unlock(&pdev->dev);
+	put_device(&pdev->dev);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_dart_set_unavailable);
 
 /*
  * A DART that didn't confirm an invalidation may still translate through stale
@@ -1018,6 +1116,10 @@ static int apple_dart_finalize_domain(struct apple_dart_domain *dart_domain,
 	int ret = 0;
 	int i, j;
 
+	ret = apple_dart_check_available(cfg);
+	if (ret)
+		return ret;
+
 	if (dart->pgsize > PAGE_SIZE)
 		return -EINVAL;
 
@@ -1150,7 +1252,11 @@ static int apple_dart_attach_dev_identity(struct iommu_domain *domain,
 {
 	struct apple_dart_master_cfg *cfg = dev_iommu_priv_get(dev);
 	struct apple_dart_stream_map *stream_map;
-	int i;
+	int i, ret;
+
+	ret = apple_dart_check_available(cfg);
+	if (ret)
+		return ret;
 
 	if (!cfg->supports_bypass)
 		return -EINVAL;
@@ -1175,7 +1281,11 @@ static int apple_dart_attach_dev_blocked(struct iommu_domain *domain,
 {
 	struct apple_dart_master_cfg *cfg = dev_iommu_priv_get(dev);
 	struct apple_dart_stream_map *stream_map;
-	int i;
+	int i, ret;
+
+	ret = apple_dart_check_available(cfg);
+	if (ret)
+		return ret;
 
 	for_each_stream_map(i, cfg, stream_map)
 		apple_dart_hw_disable_dma(stream_map);
@@ -1195,10 +1305,14 @@ static struct iommu_device *apple_dart_probe_device(struct device *dev)
 {
 	struct apple_dart_master_cfg *cfg = dev_iommu_priv_get(dev);
 	struct apple_dart_stream_map *stream_map;
-	int i;
+	int i, ret;
 
 	if (!cfg)
 		return ERR_PTR(-ENODEV);
+
+	ret = apple_dart_check_available(cfg);
+	if (ret)
+		return ERR_PTR(ret);
 
 	for_each_stream_map(i, cfg, stream_map)
 		device_link_add(
@@ -1252,13 +1366,19 @@ static int apple_dart_of_xlate(struct device *dev,
 {
 	struct apple_dart_master_cfg *cfg = dev_iommu_priv_get(dev);
 	struct platform_device *iommu_pdev = of_find_device_by_node(args->np);
-	struct apple_dart *dart = platform_get_drvdata(iommu_pdev);
+	struct apple_dart *dart;
 	struct apple_dart *cfg_dart;
-	dma_addr_t dma_max = DMA_BIT_MASK(dart->ias);
+	dma_addr_t dma_max;
 	dma_addr_t dma_min = 0;
 	int i, sid;
 
+	if (!iommu_pdev)
+		return -EPROBE_DEFER;
+	dart = platform_get_drvdata(iommu_pdev);
 	put_device(&iommu_pdev->dev);
+	if (!dart || !apple_dart_is_available(dart))
+		return -EPROBE_DEFER;
+	dma_max = DMA_BIT_MASK(dart->ias);
 
 	if (args->args_count != 1 && args->args_count != 5)
 		return -EINVAL;
@@ -1680,6 +1800,11 @@ static int apple_dart_probe(struct platform_device *pdev)
 
 	dart->dev = dev;
 	dart->hw = of_device_get_match_data(dev);
+	dart->manual_availability =
+		of_property_read_bool(dev->of_node, "apple,manual-availability");
+	if (dart->manual_availability && dart->hw->type != DART_S5L8960X)
+		return dev_err_probe(dev, -EINVAL,
+				     "manual availability requires a legacy DART\n");
 	spin_lock_init(&dart->lock);
 	spin_lock_init(&dart->tcr_lock);
 
@@ -1753,14 +1878,21 @@ static int apple_dart_probe(struct platform_device *pdev)
 			goto err_clk_disable;
 	}
 
-	ret = apple_dart_hw_reset(dart);
-	if (ret)
-		goto err_clk_disable;
+	/*
+	 * J98a's PCIe DART has manual-availability in the stock ADT. iOS
+	 * AppleS5L8960XDART (20H392, 0xfffffff005e2fcb8) waits for the host
+	 * to signal availability before activating hardware. Powering its
+	 * PMGR domain alone does not establish that the port is accessible.
+	 */
+	if (!dart->manual_availability) {
+		ret = apple_dart_hw_reset(dart);
+		if (ret)
+			goto err_clk_disable;
 
-	ret = request_irq(dart->irq, dart->hw->irq_handler, IRQF_SHARED,
-			  "apple-dart fault handler", dart);
-	if (ret)
-		goto err_clk_disable;
+		ret = apple_dart_request_irq(dart);
+		if (ret)
+			goto err_clk_disable;
+	}
 
 	platform_set_drvdata(pdev, dart);
 
@@ -1775,15 +1907,18 @@ static int apple_dart_probe(struct platform_device *pdev)
 
 	dev_info(
 		&pdev->dev,
-		"DART [pagesize %x, %d streams, bypass support: %d, bypass forced: %d, AS %d -> %d] initialized\n",
+		"DART [pagesize %x, %d streams, bypass support: %d, bypass forced: %d, AS %d -> %d] %s\n",
 		dart->pgsize, dart->num_streams, dart->supports_bypass,
-		dart->pgsize > PAGE_SIZE, dart->ias, dart->oas);
+		dart->pgsize > PAGE_SIZE, dart->ias, dart->oas,
+		dart->manual_availability ? "waiting for PCIe availability" : "initialized");
 	return 0;
 
 err_sysfs_remove:
 	iommu_device_sysfs_remove(&dart->iommu);
 err_free_irq:
-	free_irq(dart->irq, dart);
+	platform_set_drvdata(pdev, NULL);
+	if (dart->irq_requested)
+		free_irq(dart->irq, dart);
 err_clk_disable:
 	clk_bulk_disable_unprepare(dart->num_clks, dart->clks);
 
@@ -1794,11 +1929,16 @@ static void apple_dart_remove(struct platform_device *pdev)
 {
 	struct apple_dart *dart = platform_get_drvdata(pdev);
 
-	apple_dart_hw_reset(dart);
-	free_irq(dart->irq, dart);
+	if (apple_dart_is_available(dart))
+		apple_dart_hw_reset(dart);
+	/* Prevent further manual-DART IRQ work before freeing the handler. */
+	smp_store_release(&dart->available, false);
+	if (dart->irq_requested)
+		free_irq(dart->irq, dart);
 
 	iommu_device_unregister(&dart->iommu);
 	iommu_device_sysfs_remove(&dart->iommu);
+	platform_set_drvdata(pdev, NULL);
 
 	clk_bulk_disable_unprepare(dart->num_clks, dart->clks);
 }
@@ -1993,6 +2133,9 @@ static __maybe_unused int apple_dart_suspend(struct device *dev)
 	struct apple_dart *dart = dev_get_drvdata(dev);
 	unsigned int sid, idx;
 
+	if (!apple_dart_is_available(dart))
+		return 0;
+
 	for (sid = 0; sid < dart->num_streams; sid++) {
 		dart->save_tcr[sid] = dart->hw->read_tcr(dart, sid);
 		for (idx = 0; idx < dart->hw->ttbr_count; idx++)
@@ -2008,6 +2151,9 @@ static __maybe_unused int apple_dart_resume(struct device *dev)
 	struct apple_dart *dart = dev_get_drvdata(dev);
 	unsigned int sid, idx;
 	int ret;
+
+	if (!apple_dart_is_available(dart))
+		return 0;
 
 	ret = apple_dart_hw_reset(dart);
 	if (ret) {
