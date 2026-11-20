@@ -26,6 +26,10 @@ properties:
   compatible:
     oneOf:
       - items:
+          - const: apple,s8001-spi
+          - const: apple,s8000-spi
+          - const: apple,spi
+      - items:
           - const: apple,t8015-spi
           - const: apple,t8010-spi
           - const: apple,spi

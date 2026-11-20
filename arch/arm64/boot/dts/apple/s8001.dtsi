@@ -135,6 +135,19 @@
 			status = "disabled";
 		};
 
+		spi3: spi@20a08c000 {
+			compatible = "apple,s8001-spi", "apple,s8000-spi", "apple,spi";
+			reg = <0x2 0x0a08c000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 217 IRQ_TYPE_LEVEL_HIGH>;
+			/* Boards supply the functional clock when enabling the controller. */
+			clocks = <&clkref>;
+			power-domains = <&ps_spi3>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "disabled";
+		};
+
 		serial0: serial@20a0c0000 {
 			compatible = "apple,s5l-uart";
 			reg = <0x2 0x0a0c0000 0x0 0x4000>;

@@ -13,6 +13,14 @@
 	compatible = "apple,j98a", "apple,s8001", "apple,arm-platform";
 	model = "Apple iPad Pro (12.9-inch) (Wi-Fi)";
 
+	spi3_nclk: clock-spi3-nclk {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		/* Live arm-io clock-frequencies[0x30], for SPI3 clock ID 0x130. */
+		clock-frequency = <61538461>;
+		clock-output-names = "spi3-nclk";
+	};
+
 	aliases {
 		als0 = &als_primary;
 		serial5 = &serial5;
@@ -108,4 +116,11 @@
 		apple,calibration-orientation = <5>;
 		apple,calibration-source = <&als_primary>;
 	};
+};
+
+
+&spi3 {
+	clocks = <&spi3_nclk>;
+	cs-gpios = <&pinctrl_ap 169 GPIO_ACTIVE_LOW>;
+	status = "okay";
 };
