@@ -57,8 +57,8 @@ properties:
   apple,calibration-source:
     $ref: /schemas/types.yaml#/definitions/phandle
     description: |
-      Peer CT821 node carrying the common apple,als-calibration table.
-      Both sensors share one factory slot.
+      Peer CT821 node supplying the shared factory table through
+      apple,als-calibration or its calibration NVMEM cell.
 
   nvmem-cells:
     description:

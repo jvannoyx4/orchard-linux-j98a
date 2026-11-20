@@ -17,6 +17,7 @@
 #include <linux/slab.h>
 #include <linux/module.h>
 #include <linux/nvmem-consumer.h>
+#include <linux/of.h>
 #include <linux/overflow.h>
 #include <linux/property.h>
 #include <linux/iio/iio.h>
@@ -298,8 +299,19 @@ static u8 *apple_als_read_calibration(struct device *dev, size_t *len)
 		source = fwnode_find_reference(dev_fwnode(dev), "apple,calibration-source", 0);
 		if (IS_ERR(source))
 			return ERR_CAST(source);
-		data = apple_als_copy_calibration(source, len);
+		if (fwnode_property_present(source, "apple,als-calibration")) {
+			data = apple_als_copy_calibration(source, len);
+			fwnode_handle_put(source);
+			return data;
+		}
+
+		cell = of_nvmem_cell_get(to_of_node(source), "calibration");
 		fwnode_handle_put(source);
+		if (IS_ERR(cell))
+			return ERR_CAST(cell);
+
+		data = nvmem_cell_read(cell, len);
+		nvmem_cell_put(cell);
 		return data;
 	}
 
