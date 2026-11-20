@@ -121,7 +121,6 @@ allOf:
           minItems: 9
           maxItems: 9
         reg-names:
-          maxItems: 9
           items:
             - const: config
             - const: rc
