@@ -69,6 +69,14 @@ config PCIE_APPLE_H9P
 	  handles their link setup, MSI routing, and storage-specific DMA
 	  translation.
 
+config PCIE_APPLE_H9P_KUNIT_TEST
+	bool "KUnit tests for Apple H9P PCIe MSI routing" if !KUNIT_ALL_TESTS
+	depends on PCIE_APPLE_H9P && KUNIT
+	default KUNIT_ALL_TESTS
+	help
+	  Test interrupt vector allocation on uniform and sparse root-port
+	  layouts. These tests run without a PCIe host or attached endpoints.
+
 config PCI_VERSATILE
 	bool "ARM Versatile PB PCI controller"
 	depends on ARCH_VERSATILE || COMPILE_TEST
