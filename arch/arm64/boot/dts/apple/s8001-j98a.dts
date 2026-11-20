@@ -37,3 +37,42 @@
 		};
 	};
 };
+
+&{/soc} {
+	/* The three populated PCIe ports each have their own DART. */
+	pcie0_dart0: iommu@601008000 {
+		compatible = "apple,s8001-dart", "apple,s5l8960x-dart";
+		reg = <0x6 0x01008000 0x0 0x4000>;
+		#iommu-cells = <5>;
+		interrupts = <AIC_IRQ 271 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_pcie_link0>;
+		apple,error-reflector = /bits/ 64 <0x20fffc000>;
+		apple,fetch-config = <0x000e0303>;
+		apple,diag-config = <0x00000100>;
+		status = "disabled";
+	};
+
+	pcie0_dart2: iommu@603008000 {
+		compatible = "apple,s8001-dart", "apple,s5l8960x-dart";
+		reg = <0x6 0x03008000 0x0 0x4000>;
+		#iommu-cells = <5>;
+		interrupts = <AIC_IRQ 277 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_pcie_link2>;
+		apple,error-reflector = /bits/ 64 <0x20fffc000>;
+		apple,fetch-config = <0x000e0303>;
+		apple,diag-config = <0x00000100>;
+		status = "disabled";
+	};
+
+	pcie0_dart4: iommu@605008000 {
+		compatible = "apple,s8001-dart", "apple,s5l8960x-dart";
+		reg = <0x6 0x05008000 0x0 0x4000>;
+		#iommu-cells = <5>;
+		interrupts = <AIC_IRQ 283 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_pcie_link4>;
+		apple,error-reflector = /bits/ 64 <0x20fffc000>;
+		apple,fetch-config = <0x000e0303>;
+		apple,diag-config = <0x00000100>;
+		status = "disabled";
+	};
+};
