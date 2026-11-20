@@ -153,6 +153,11 @@ module_param(j98a_probe, bool, 0400);
 MODULE_PARM_DESC(j98a_probe,
 		"Run one J98a HBPP readiness probe without firmware or input");
 
+static bool j98a_firmware_probe;
+module_param(j98a_firmware_probe, bool, 0400);
+MODULE_PARM_DESC(j98a_firmware_probe,
+		"With j98a_probe, upload private J98a RAM firmware and read metadata once; no input");
+
 struct apple_z2_hbpp_reg {
 	u32 addr;
 	u32 value;
@@ -4344,16 +4349,198 @@ static const struct apple_z2_chip_info apple_z2_j98a_probe_info = {
 	.variant = APPLE_Z2_VARIANT_J98A_PROBE,
 };
 
+#define APPLE_Z2_J98A_TEST_FIRMWARE "apple/j98a-touch-test.z2fw"
+#define APPLE_Z2_J98A_UPLOAD_HZ 4000000
+#define APPLE_Z2_J98A_PACKETS 8
+
+struct apple_z2_j98a_firmware {
+	const u8 *packet[APPLE_Z2_J98A_PACKETS];
+	u32 length[APPLE_Z2_J98A_PACKETS];
+};
+
+/* Validate the complete private K1F18,2 test bundle before powering up. */
+static int apple_z2_j98a_check_blob(const u8 *data, u32 len,
+				    u32 address, u32 payload_size)
+{
+	u32 sum = 0;
+	u32 i;
+
+	if (len != payload_size + 16 ||
+	    memcmp(data, "\x18\xe1\x30\x01", 4) ||
+	    ((u32)get_unaligned_be16(data + 4) + 1) * 4 != payload_size ||
+	    apple_z2_hbpp_get32(data + 6) != address ||
+	    apple_z2_hbpp_sum(data + 4, 6) != get_unaligned_be16(data + 10))
+		return -EINVAL;
+	for (i = 12; i < len - 4; i++)
+		sum += data[i];
+	return sum == apple_z2_hbpp_get32(data + len - 4) ? 0 : -EBADMSG;
+}
+
+static int apple_z2_j98a_check_firmware(const struct firmware *fw,
+					struct apple_z2_j98a_firmware *image)
+{
+	static const u32 config[] = {
+		0x97f, 16, 125, 10000, 1, 1, 0, 41, 0, 500, 0x104,
+	};
+	static const u32 addresses[] = { 0x100000, 0x100400, 0x102a00, 0x101400 };
+	static const u32 sizes[] = { 215036, 4096, 512, 4096 };
+	static const u32 writes[][3] = {
+		{ 0x102c00, 0xffffffff, 0 },
+		{ 0x40000080, 0x100, 0x100 },
+		{ 0x400b0000, 1, 0 },
+		{ 0x400b0000, 1, 1 },
+	};
+	const u8 *data;
+	size_t pos = 8, padded;
+	u32 code, len;
+	unsigned int record, i;
+	int error;
+
+	if (fw->size < 8 || fw->size > 0x44000 ||
+	    get_unaligned_le32(fw->data) != APPLE_Z2_FW_MAGIC ||
+	    get_unaligned_le32(fw->data + 4) != 1)
+		return -EINVAL;
+
+	for (record = 0; record < 11; record++) {
+		if (fw->size - pos < 8)
+			return -EINVAL;
+		code = get_unaligned_le32(fw->data + pos);
+		len = get_unaligned_le32(fw->data + pos + 4);
+		pos += 8;
+		if (len > fw->size - pos)
+			return -EINVAL;
+		padded = round_up((size_t)len, 4);
+		if (padded > fw->size - pos)
+			return -EINVAL;
+		data = fw->data + pos;
+		for (i = len; i < padded; i++)
+			if (data[i])
+				return -EINVAL;
+		pos += padded;
+
+		switch (record) {
+		case 0:
+			if (code != LOAD_COMMAND_SET_CONFIG || len != sizeof(config))
+				return -EINVAL;
+			for (i = 0; i < ARRAY_SIZE(config); i++)
+				if (get_unaligned_le32(data + i * 4) != config[i])
+					return -EINVAL;
+			break;
+		case 1:
+			if (code != LOAD_COMMAND_INIT_PAYLOAD || len != 4 ||
+			    memcmp(data, "\x1a\xa1\x18\xe1", 4))
+				return -EINVAL;
+			break;
+		case 10:
+			if (code != LOAD_COMMAND_WAIT_IRQ || len != 4 ||
+			    get_unaligned_le32(data) != 5000)
+				return -EINVAL;
+			break;
+		default:
+			if (code != LOAD_COMMAND_SEND_BLOB)
+				return -EINVAL;
+			if (record < 6) {
+				error = apple_z2_j98a_check_blob(data, len,
+						addresses[record - 2], sizes[record - 2]);
+				if (error)
+					return error;
+			} else {
+				if (len != 16 || memcmp(data, "\x1e\x33", 2) ||
+				    apple_z2_hbpp_sum(data + 2, 12) !=
+						get_unaligned_be16(data + 14))
+					return -EINVAL;
+				for (i = 0; i < 3; i++)
+					if (apple_z2_hbpp_get32(data + 2 + i * 4) !=
+					    writes[record - 6][i])
+						return -EINVAL;
+			}
+			image->packet[record - 2] = data;
+			image->length[record - 2] = len;
+			break;
+		}
+	}
+	return pos == fw->size ? 0 : -EINVAL;
+}
+
+/*
+ * K1HBPP14 stock sendFirmware/bootSequence, without their retries. Preserve
+ * the preconstructed byte stream and its 8-bit wire order. The final RMW
+ * starts execution: stock still transfers ATN_ACK but skips its value check.
+ * All addresses, masks and payload lengths were checked before power-up.
+ */
+static int apple_z2_j98a_firmware_once(struct apple_z2 *z2,
+				       const struct apple_z2_j98a_firmware *image)
+{
+	static const u8 reports[] = { 0xd1, 0xd3, 0xd9 };
+	struct device *dev = &z2->spidev->dev;
+	struct spi_transfer xfer = { .bits_per_word = 8 };
+	u16 reply, len;
+	u8 status;
+	unsigned int i;
+	int error;
+
+	for (i = 0; i < APPLE_Z2_J98A_PACKETS; i++) {
+		xfer.tx_buf = image->packet[i];
+		xfer.len = image->length[i];
+		/* The firmware packet exceeds the PIO deadline at 500 kHz. */
+		xfer.speed_hz = i < 4 ? APPLE_Z2_J98A_UPLOAD_HZ : 0;
+		error = spi_sync_transfer(z2->spidev, &xfer, 1);
+		if (error)
+			return dev_err_probe(dev, error,
+					     "J98a packet %u transfer failed\n", i);
+		error = apple_z2_hbpp_ack(z2, &reply);
+		if (error)
+			return dev_err_probe(dev, error,
+					     "J98a packet %u ACK transfer failed\n", i);
+		dev_info(dev, "J98a packet %u (%u bytes) ACK=%04x%s\n",
+			 i, image->length[i], reply,
+			 i == 7 ? " (execution ACK value unchecked)" : "");
+		if (i != 7 && reply != (i < 4 ? APPLE_Z2_HBPP_ACK_BLOB :
+					       APPLE_Z2_HBPP_ACK_WRITE))
+			return -EPROTO;
+	}
+
+	/* The profile bounds first boot at 5 s. This diagnostic requests no IRQ. */
+	msleep(5000);
+	z2->protocol_state = APPLE_Z2_STATE_FIRMWARE_READY;
+	z2->z2_inter_packet_delay_us = 125;
+	z2->z2_cs_delay_us = 10;
+	error = apple_z2_read_device_info_locked(z2);
+	dev_info(dev, "J98a E2 result=%d reply=%*ph\n", error,
+		 APPLE_Z2_CMD_SIZE, z2->rx_buf);
+	if (error)
+		return error;
+	dev_info(dev, "J98a platform=%u interface=%u max-packet=%u\n",
+		 z2->rx_buf[1], z2->rx_buf[2], get_unaligned_le16(z2->rx_buf + 3));
+	for (i = 0; i < ARRAY_SIZE(reports); i++) {
+		error = apple_z2_read_report_info_locked(z2, reports[i], &status,
+							 &len, "j98a-metadata");
+		dev_info(dev, "J98a E3 report=%02x result=%d reply=%*ph\n",
+			 reports[i], error, APPLE_Z2_CMD_SIZE, z2->rx_buf);
+		if (error)
+			return error;
+		dev_info(dev, "J98a report=%02x status=%u length=%u (no report read)\n",
+			 reports[i], status, len);
+	}
+	return 0;
+}
+
 /*
  * The stock J98a power sequence enables analog and LDO, then peripheral
  * display sync and a 10 ms delay. Its HID transport's default reset sequence
  * asserts and releases reset for 1 ms each. The PMGR clock uses 8/100 us
  * enable/disable delays and a 24 MHz reference. This probe establishes only
- * HBPP readiness; clock placement and SPI timing still need a hardware test.
+ * HBPP readiness, or optionally firmware metadata. Readiness was observed on
+ * J98a with this clock placement; it does not establish full input support.
  */
 static int apple_z2_j98a_probe_once(struct apple_z2 *z2)
 {
 	struct device *dev = &z2->spidev->dev;
+	const struct firmware *fw = NULL;
+	struct apple_z2_j98a_firmware image = { };
+	struct spi_delay cs_setup = z2->spidev->cs_setup;
+	struct spi_delay cs_hold = z2->spidev->cs_hold;
+	struct spi_delay cs_inactive = z2->spidev->cs_inactive;
 	struct spi_transfer xfer = {
 		.tx_buf = z2->tx_buf,
 		.rx_buf = z2->rx_buf,
@@ -4385,7 +4572,20 @@ static int apple_z2_j98a_probe_once(struct apple_z2 *z2)
 	if ((z2->spidev->mode & SPI_MODE_X_MASK) != SPI_MODE_3)
 		return dev_err_probe(dev, -EINVAL, "J98a probe requires SPI mode 3\n");
 
-	dev_info(dev, "J98a: one HBPP readiness probe; no firmware upload or input device\n");
+	if (j98a_firmware_probe) {
+		error = request_firmware_direct(&fw, APPLE_Z2_J98A_TEST_FIRMWARE, dev);
+		if (error)
+			return dev_err_probe(dev, error,
+					     "J98a private test firmware unavailable\n");
+		error = apple_z2_j98a_check_firmware(fw, &image);
+		if (error) {
+			release_firmware(fw);
+			return dev_err_probe(dev, error, "invalid J98a private test firmware\n");
+		}
+		dev_info(dev, "J98a: one RAM firmware/metadata probe; no input device\n");
+	} else {
+		dev_info(dev, "J98a: one HBPP readiness probe; no firmware upload or input device\n");
+	}
 	error = pinctrl_select_state(z2->sync_pinctrl, z2->sync_inactive);
 	if (error)
 		goto power_off;
@@ -4413,8 +4613,15 @@ static int apple_z2_j98a_probe_once(struct apple_z2 *z2)
 		if (z2->rx_buf[0] != 0x1f || z2->rx_buf[1] != 0x01)
 			error = -EPROTO;
 	}
+	if (!error && j98a_firmware_probe)
+		error = apple_z2_j98a_firmware_once(z2, &image);
 power_off:
 	cleanup_error = apple_z2_j98a_power_off(z2);
+	z2->protocol_state = APPLE_Z2_STATE_OFF;
+	z2->spidev->cs_setup = cs_setup;
+	z2->spidev->cs_hold = cs_hold;
+	z2->spidev->cs_inactive = cs_inactive;
+	release_firmware(fw);
 	if (!error)
 		error = cleanup_error;
 	dev_info(dev, "J98a probe ended (%d); controller powered down\n", error);
