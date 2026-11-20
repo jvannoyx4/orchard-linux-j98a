@@ -20,6 +20,7 @@
 #include <linux/of_device.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
+#include <linux/property.h>
 #include <linux/scatterlist.h>
 #include <linux/spi/spi.h>
 #include <linux/unaligned.h>
@@ -38,6 +39,7 @@
 #define APPLE_SPI_CFG_MODE_IRQ		1
 #define APPLE_SPI_CFG_MODE_DMA		2
 #define APPLE_SPI_CFG_LSB_FIRST		BIT(13)
+#define APPLE_SPI_CFG_HALF_CLOCK_DELAY	BIT(20)
 #define APPLE_SPI_CFG_WORD_SIZE		GENMASK(16, 15)
 #define APPLE_SPI_CFG_WORD_SIZE_8B	0
 #define APPLE_SPI_CFG_FIFO_THRESH	GENMASK(18, 17)
@@ -128,6 +130,8 @@ struct apple_spi_hw {
 	 * without the descriptor format, DMA or the interrupt registers.
 	 */
 	bool pio_only;
+	/* S8001: explicit per-peripheral half-clock timing in byte-wide PIO. */
+	bool has_half_clock_delay;
 	unsigned int min_clk_div;
 	u32 default_word_delay;
 	u32 cfg_base;
@@ -237,6 +241,10 @@ static int apple_spi_prepare_message(struct spi_controller *ctlr,
 	struct apple_spi *spi = spi_controller_get_devdata(ctlr);
 	struct spi_device *device = msg->spi;
 	u32 cfg;
+
+	if (device_property_read_bool(&device->dev, "apple,half-clock-delay") &&
+	    !spi->hw->has_half_clock_delay)
+		return -EOPNOTSUPP;
 
 	cfg = (device->mode & SPI_CPHA ? APPLE_SPI_CFG_CPHA : 0) |
 	      (device->mode & SPI_CPOL ? APPLE_SPI_CFG_CPOL : 0) |
@@ -776,6 +784,26 @@ static int apple_spi_transfer_one_t8010_pio(struct spi_controller *ctlr,
 	return 0;
 }
 
+static u32 apple_spi_legacy_config(struct apple_spi *spi,
+				   struct spi_device *device, u32 *word_delay)
+{
+	u32 cfg = spi->hw->cfg_base;
+
+	if (device->mode & SPI_CPHA)
+		cfg |= APPLE_SPI_CFG_CPHA;
+	if (device->mode & SPI_CPOL)
+		cfg |= APPLE_SPI_CFG_CPOL;
+
+	/* Stock SPI-v1 treats this as a separate flag, independent of CPOL. */
+	if (spi->hw->has_half_clock_delay &&
+	    device_property_read_bool(&device->dev, "apple,half-clock-delay")) {
+		cfg |= APPLE_SPI_CFG_HALF_CLOCK_DELAY;
+		*word_delay = max_t(u32, *word_delay, 2);
+	}
+
+	return cfg;
+}
+
 /*
  * Legacy byte-wide PIO. S8000 uses the register order validated on the
  * iPad 5; T7000 needs the counts before RUN and the TX FIFO primed after
@@ -815,11 +843,7 @@ static int apple_spi_transfer_one_legacy_pio(struct spi_controller *ctlr,
 	if (delay_ns)
 		word_delay = DIV_ROUND_UP_ULL((u64)rate * delay_ns, NSEC_PER_SEC);
 
-	cfg = spi->hw->cfg_base;
-	if (device->mode & SPI_CPHA)
-		cfg |= APPLE_SPI_CFG_CPHA;
-	if (device->mode & SPI_CPOL)
-		cfg |= APPLE_SPI_CFG_CPOL;
+	cfg = apple_spi_legacy_config(spi, device, &word_delay);
 
 	reg_write(spi, APPLE_SPI_CTRL, 0);
 	if (spi->hw->spi_v1) {
@@ -1230,6 +1254,14 @@ static const struct apple_spi_hw apple_spi_hw_s8000 = {
 	.cfg_base = APPLE_SPI_CFG_S8000_BASE,
 };
 
+static const struct apple_spi_hw apple_spi_hw_s8001 = {
+	.legacy_status = true,
+	.pio_only = true,
+	.has_half_clock_delay = true,
+	.min_clk_div = 1,
+	.cfg_base = APPLE_SPI_CFG_S8000_BASE,
+};
+
 static const struct apple_spi_hw apple_spi_hw_t8010 = {
 	.legacy_status = true,
 	.has_descriptor_dma = true,
@@ -1249,6 +1281,7 @@ static const struct apple_spi_hw apple_spi_hw_default = {
 };
 
 static const struct of_device_id apple_spi_of_match[] = {
+	{ .compatible = "apple,s8001-spi", .data = &apple_spi_hw_s8001, },
 	{ .compatible = "apple,t7000-spi", .data = &apple_spi_hw_t7000, },
 	{ .compatible = "apple,s8000-spi", .data = &apple_spi_hw_s8000, },
 	{ .compatible = "apple,t8010-spi", .data = &apple_spi_hw_t8010, },
