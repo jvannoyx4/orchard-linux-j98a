@@ -14,6 +14,7 @@
 	model = "Apple iPad Pro (12.9-inch) (Wi-Fi)";
 
 	aliases {
+		als0 = &als_primary;
 		serial5 = &serial5;
 	};
 };
@@ -86,5 +87,25 @@
 		apple,fetch-config = <0x000e0303>;
 		apple,diag-config = <0x00000100>;
 		status = "disabled";
+	};
+};
+
+&i2c3 {
+	status = "okay";
+
+	/* Both sensors share one factory LSCI table, provided at als0. */
+	als_primary: light-sensor@29 {
+		compatible = "apple,ct821", "amstaos,tsl2581";
+		reg = <0x29>;
+		interrupts-extended = <&pinctrl_ap 79 IRQ_TYPE_LEVEL_LOW>;
+		apple,calibration-orientation = <6>;
+	};
+
+	light-sensor@5c {
+		compatible = "apple,ct821", "amstaos,tsl2581";
+		reg = <0x5c>;
+		interrupts-extended = <&pinctrl_ap 81 IRQ_TYPE_LEVEL_LOW>;
+		apple,calibration-orientation = <5>;
+		apple,calibration-source = <&als_primary>;
 	};
 };
